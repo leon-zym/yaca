@@ -1,0 +1,43 @@
+{
+  "name": "host-scoped theme mutation commits without a run envelope",
+  "receipts": [
+    {
+      "receiptId": "receipt-theme-1",
+      "clientMutationId": "mutation-theme-1",
+      "commandType": "app.setThemePreference",
+      "scope": "host",
+      "state": "recorded",
+      "workspaceId": null,
+      "sessionId": null,
+      "runId": null,
+      "productTurnId": null,
+      "riskAcknowledgement": "not_required",
+      "recordedAt": "2026-08-19T03:00:00.000Z",
+      "acceptedAt": null,
+      "terminalAt": null,
+      "acknowledgedAt": null,
+      "error": null
+    },
+    {
+      "receiptId": "receipt-theme-1",
+      "clientMutationId": "mutation-theme-1",
+      "commandType": "app.setThemePreference",
+      "scope": "host",
+      "state": "committed",
+      "workspaceId": null,
+      "sessionId": null,
+      "runId": null,
+      "productTurnId": null,
+      "riskAcknowledgement": "not_required",
+      "recordedAt": "2026-08-19T03:00:00.000Z",
+      "acceptedAt": null,
+      "terminalAt": "2026-08-19T03:00:00.010Z",
+      "acknowledgedAt": null,
+      "error": null
+    }
+  ],
+  "expect": {
+    "runEnvelopeCount": 0,
+    "terminalState": "committed"
+  }
+}

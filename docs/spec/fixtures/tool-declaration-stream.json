@@ -1,0 +1,87 @@
+{
+  "name": "tool declaration streams arguments before execution",
+  "events": [
+    {
+      "v": 1,
+      "connectionSeq": 40,
+      "type": "tool.declaration_started",
+      "workspaceId": "workspace-1",
+      "sessionId": "session-1",
+      "sessionVersion": "version-1",
+      "runtimeEpoch": "epoch-1",
+      "runId": "run-1",
+      "runSeq": 1,
+      "payload": {
+        "productTurnId": "turn-1",
+        "stepId": "step-1",
+        "blockId": "block-tool-1",
+        "sourceIndex": 0,
+        "toolCallId": "tool-call-1",
+        "name": "read"
+      }
+    },
+    {
+      "v": 1,
+      "connectionSeq": 41,
+      "type": "tool.declaration_delta",
+      "workspaceId": "workspace-1",
+      "sessionId": "session-1",
+      "sessionVersion": "version-1",
+      "runtimeEpoch": "epoch-1",
+      "runId": "run-1",
+      "runSeq": 2,
+      "payload": {
+        "productTurnId": "turn-1",
+        "stepId": "step-1",
+        "blockId": "block-tool-1",
+        "toolCallId": "tool-call-1",
+        "argumentsFragment": "{\"path\":\""
+      }
+    },
+    {
+      "v": 1,
+      "connectionSeq": 42,
+      "type": "tool.declaration_delta",
+      "workspaceId": "workspace-1",
+      "sessionId": "session-1",
+      "sessionVersion": "version-1",
+      "runtimeEpoch": "epoch-1",
+      "runId": "run-1",
+      "runSeq": 3,
+      "payload": {
+        "productTurnId": "turn-1",
+        "stepId": "step-1",
+        "blockId": "block-tool-1",
+        "toolCallId": "tool-call-1",
+        "argumentsFragment": "README.md\"}"
+      }
+    },
+    {
+      "v": 1,
+      "connectionSeq": 43,
+      "type": "tool.declaration_settled",
+      "workspaceId": "workspace-1",
+      "sessionId": "session-1",
+      "sessionVersion": "version-1",
+      "runtimeEpoch": "epoch-1",
+      "runId": "run-1",
+      "runSeq": 4,
+      "payload": {
+        "productTurnId": "turn-1",
+        "stepId": "step-1",
+        "blockId": "block-tool-1",
+        "toolCallId": "tool-call-1",
+        "parsedArguments": {
+          "path": "README.md"
+        },
+        "error": null
+      }
+    }
+  ],
+  "expect": {
+    "targetBlockId": "block-tool-1",
+    "toolCallId": "tool-call-1",
+    "declarationStatus": "ready",
+    "executionMaySettleOutOfOrder": true
+  }
+}

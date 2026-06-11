@@ -30,6 +30,7 @@ The release path is complete only when a user can:
 - Validate Workspace paths as canonical, existing, directory, readable, searchable, and writable before registration; reject canonical duplicates.
 - List, create, activate, inspect, rename, recoverably trash, list trashed, and restore Sessions.
 - Retain Trashed Sessions and their referenced content indefinitely. The MVP has no permanent-delete command; users may clear `~/.yaca/trash/` manually.
+- Reject Active Session trash while running or stopping. While idle, atomically dispose it, advance runtime epoch, trash it, and activate the most recently updated surviving Session in the same Workspace or none; rollback restores the original Session or enters truthful degraded state.
 - Run one Active Session at a time.
 - Inspect another Session's Committed Snapshot while the Active Session is running; inspection does not replace the runtime.
 - Change the Active Session only while no Run is active.
@@ -56,16 +57,17 @@ The release path is complete only when a user can:
 - Dedicated edit/write view with patch or diff and affected path.
 - Dedicated shell view with command, streaming output, exit state, truncation, and complete-content access where available.
 - A generic, safe fallback for every unknown tool.
+- Dedicated tool-declaration start, argument-fragment, and parsed-arguments/error projection before execution; incomplete declaration does not require presenter details.
 
 ### Resilience
 
-- Reconcile realtime state with a bounded Host snapshot and an atomic event-sequence watermark after refresh or connection loss.
-- Record state-changing command delivery durably before invoking the coding-agent runtime.
+- Reconcile global realtime state with a bounded `app.sync` Host snapshot and an atomic event-sequence watermark after refresh, gap, epoch mismatch, overflow, or connection loss. Session sync remains a navigation read.
+- Record every mutation with Host, Workspace, Session, or Run scope before its local or runtime side effect.
 - Return an existing Command Receipt for a duplicate mutation identifier.
-- Distinguish Unknown Delivery, where runtime acceptance is unproven, from Outcome Unknown, where acceptance is proven but no terminal result is durable.
-- Never automatically replay either unknown state. Require sync and explicit risk acknowledgement before another side-effecting mutation for the affected Session.
+- Use committed/failed outcomes for non-Prompt mutations; Unknown Delivery means their local commit is unproven or Prompt acceptance is unproven. Only accepted Prompt creates a Run envelope, and Outcome Unknown means that accepted Prompt has no durable terminal result.
+- Never automatically replay either unknown state. Require full application sync and explicit risk acknowledgement before another side-effecting mutation within the receipt's scope.
 - Rebuild committed conversation state from the durable Session after Host restart.
-- Preserve partial visible output as interrupted when the Host can still prove it; otherwise show the Committed Snapshot and interruption explicitly.
+- Preserve a proven interrupted partial when available. After Host restart, keep accepted nonterminal receipt state as Outcome Unknown and show restart only as the explanatory interruption reason.
 - Persist the minimum Run identity envelope needed to relate the Prompt receipt, Run, Product Turn, Session, runtime projection epoch, and pre-Run Session Version.
 
 ### Product quality
@@ -113,7 +115,7 @@ SDK repository research confirms that the public 0.84.2 package exposes the requ
 The MVP is releasable only when:
 
 - formatting, static checks, type checks, automated tests, and the production build pass from the lockfile;
-- protocol compatibility, projection, Command Ledger, Pi adapter, reconnect, and restart suites pass;
+- protocol compatibility, global app-sync, projection, scoped Command Ledger, Pi adapter, reconnect, and restart suites pass;
 - Playwright covers the required vertical path, Stop with exact Run identity, model/Thinking timing, theme restart persistence, trash/list/restore, refresh, forced connection loss, and Host restart;
 - a real DeepSeek acceptance Run performs a tool call and file modification without exposing its credential;
 - Light, Dark, reduced-motion, keyboard, long-content, and empty/error states have independent evidence;

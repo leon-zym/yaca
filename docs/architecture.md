@@ -92,7 +92,7 @@ The adapter owns SDK-specific types, lifecycle, event names, error classificatio
 
 - `WorkspaceCatalog` owns registered canonical Workspace paths and display metadata.
 - `SessionCatalog` lists durable Sessions and Trashed Sessions by registered Workspace, returns committed summaries without activating them, and restores trashed files without permanent deletion.
-- `CommandLedger` durably records state-changing command delivery, minimum Run envelopes, risk acknowledgements, and terminal outcomes.
+- `CommandLedger` durably records Host/Workspace/Session/Run-scoped mutation receipts, Prompt-only Run envelopes, risk acknowledgements, and terminal outcomes.
 - `PreferenceStore` owns the persisted `system`, `light`, or `dark` theme preference returned by bootstrap.
 - `ContentStore` ingests complete oversized content and returns scoped Content References.
 - `SessionProjector` converts Pi facts into Product Turns, Assistant Steps, stable Content Blocks, tool executions, and error states.
@@ -138,7 +138,7 @@ Authority is divided by fact, not duplicated:
 | Fact | Authority | Rebuild behavior |
 |---|---|---|
 | Conversation, branch, selected durable Session state | Pi-managed Session JSONL | Reopened through public SessionManager surfaces |
-| Active Run and streaming partials | AgentRuntimeKernel memory | Lost on Host crash; surfaced as interrupted |
+| Active Run and streaming partials | AgentRuntimeKernel memory plus minimum accepted Run envelope | Overlay is lost on Host crash; accepted nonterminal outcome remains unknown with a restart reason |
 | Command delivery and terminal outcome | Command Ledger | Parsed from durable valid prefix |
 | Run-to-Product-Turn identity | Minimum Run envelope in Command Ledger | Reconciled before Session content projection |
 | Workspace registration | Workspace registry | Atomically replaced after fsync |
@@ -152,38 +152,40 @@ Workspace registration stores a canonical realpath plus a user-editable display 
 
 Session trash moves the Session and restore metadata under `~/.yaca/trash/`. Trashed Sessions and referenced Content Store objects are retained indefinitely, appear in a trash list, and can be restored when the original Workspace remains registered and the destination does not conflict. The MVP exposes no permanent-delete command; users may manually clear the trash directory. Removing a Workspace registration never deletes Workspace files, Sessions, or trash.
 
+An Active Session cannot be trashed while `running` or `stopping`. While idle, the Host preflights a fallback, disposes the runtime, increments its projection epoch, moves the Session, and chooses the most recently updated surviving Session in that Workspace or none. The committed event order is active-session change followed by trash-directory change. A post-dispose failure moves the file back and reopens the original under another epoch; failed compensation enters degraded mode without claiming trash success.
+
 Theme preference is Host-owned application state. Bootstrap always returns `system`, `light`, or `dark`; an application command atomically persists updates under `~/.yaca/app/` and broadcasts the accepted value. Browser-local theme is only a pre-bootstrap rendering hint.
 
 ## Command delivery and recovery
 
 The SDK does not provide an atomic transaction between a yaca command record and `prompt()`. yaca therefore promises durable at-most-once invocation, not exactly-once execution.
 
-For each state-changing command:
+Every state-changing command records a scope: Host, Workspace, Session, or Run. Local mutations and runtime controls other than Prompt use `recorded → committed | failed | delivery_unknown`; `delivery_unknown` means durable intent exists but commit cannot be proven. Only `run.prompt` uses acceptance and creates a Run envelope:
 
 1. The Host validates authentication, schema, phase, and expected Session Version.
 2. It appends a `recorded` Command Receipt and reaches a durability boundary.
 3. It invokes the Pi adapter.
-4. When public preflight behavior confirms acceptance, it appends one durable journal record containing the `accepted` receipt and a minimum Run envelope.
-5. On a proven terminal outcome, it appends one durable journal record containing the terminal receipt and terminal Run envelope before publishing the terminal event.
+4. When public preflight behavior confirms Prompt acceptance, it appends one durable journal record containing the `accepted` Run-scoped receipt and a minimum Run envelope.
+5. On a proven Prompt terminal outcome, it appends one durable journal record containing the terminal receipt and terminal Run envelope before publishing the terminal event. Other mutations append a scope-aware committed or failed receipt without creating a Run envelope.
 
 A minimum Run envelope contains `runId`, `productTurnId`, `sessionId`, `workspaceId`, Prompt receipt identity, client mutation identity, runtime projection epoch, base Session Version and leaf identity, Run-start model/Thinking snapshots, acceptance time, and current Run state. It omits Prompt text and Provider credentials.
 
 A duplicate mutation identifier returns its existing receipt and never invokes the adapter again. Recovery uses this strict priority:
 
-1. A valid combined terminal journal record is authoritative for command and Run outcome.
-2. A durable `accepted` receipt plus Run envelope without a terminal record becomes `outcome_unknown`; Session JSONL content may be displayed but cannot upgrade the outcome.
-3. A `recorded` receipt without durable acceptance becomes `delivery_unknown`, even when nearby Session content looks similar to the Prompt.
+1. A valid local committed/failed record or combined Prompt terminal journal record is authoritative.
+2. A durable accepted Prompt receipt plus Run envelope without a terminal record becomes `outcome_unknown` with a Host-restart interruption reason; it is never rewritten to `interrupted`. Session JSONL content may be displayed but cannot upgrade the outcome.
+3. Any recorded local intent without proven commit, and a recorded Prompt without durable acceptance, becomes `delivery_unknown`.
 4. A corrupt journal tail is quarantined; affected Sessions enter degraded mode and block new side-effecting mutations.
 5. Session JSONL is then reopened to rebuild committed content from the Run envelope's base identity.
 6. A new runtime projection epoch is created, and every old-epoch Active Overlay event is discarded.
 
-Neither Unknown Delivery nor Outcome Unknown is automatically replayed. The affected Session blocks Prompt, activation, rename, trash, and other side-effecting mutations until sync completes and the user explicitly acknowledges the specific receipt and risk. Inspection, content reads, theme changes, and the acknowledgement command remain available. After acknowledgement, a new Prompt is allowed only while the Active Session is idle, against the synced Session Version and runtime epoch, and with a new mutation identifier.
+Neither Unknown Delivery nor Outcome Unknown is automatically replayed. Risk blocks mutations at receipt scope: Host, Workspace and descendants, Session and Runs, or the affected Run's Session side effects. After full application sync and explicit acknowledgement of that receipt, new in-scope mutation is allowed under current phase/version rules with a new mutation identifier. Reads and acknowledgement remain available; acknowledgement discovers scope from the receipt and never requires a Session payload.
 
 Recovery behavior:
 
 - Browser reconnect: handshake, recent receipts, atomic sync, then buffered projected events.
-- Sequence gap: stop applying deltas and request sync.
-- Host restart: reopen the Session, rebuild the Committed Snapshot, mark the prior Run interrupted, and remain idle.
+- Sequence gap: stop applying deltas and request full application sync.
+- Host restart: reopen the Session, rebuild the Committed Snapshot, classify recorded Prompt as Unknown Delivery or accepted nonterminal Prompt as Outcome Unknown, attach a restart reason for UI explanation, and remain idle.
 - JSONL failure: preserve the source, expose the readable prefix if the public SDK permits it, and avoid writes until the user selects a safe recovery action.
 - Command Ledger tail damage: preserve the valid prefix, quarantine the unreadable tail, and classify each affected receipt as Unknown Delivery or Outcome Unknown from the last durable transition.
 
@@ -191,7 +193,7 @@ Recovery behavior:
 
 Every runtime projection has an opaque `runtimeEpoch`. Host restart, active runtime replacement, Session activation, adapter resubscription, or projection reset creates a new epoch. Runtime-scoped events always carry it; a client discards an old-epoch event and requests sync rather than merging it into the current Active Overlay.
 
-`app.bootstrap` and `session.sync` use a connection-local sequence barrier:
+`connectionSeq` orders all application events for one connection. `app.bootstrap` and `app.sync` use a connection-global sequence barrier:
 
 1. The connection event multiplexer pauses delivery and buffers newly assigned events.
 2. The AgentRuntimeKernel serial queue reaches a barrier after all earlier state transitions.
@@ -199,9 +201,9 @@ Every runtime projection has an opaque `runtimeEpoch`. Host restart, active runt
 4. The Host writes the sync response before any post-barrier event frame on the same WebSocket.
 5. The client atomically replaces its projection, runtime epoch, and last applied sequence with the snapshot and `snapshotSeq`.
 6. The Host releases buffered events in ascending sequence order.
-7. The client discards duplicates at or below its last applied sequence, accepts exactly `last + 1`, and starts another sync on a gap or epoch mismatch.
+7. The client discards duplicates at or below its last applied sequence, accepts exactly `last + 1`, and starts another `app.sync` on a gap or epoch mismatch.
 
-Each connection buffer is bounded by both event count and serialized bytes. Overflow fails the in-progress sync with `sync_buffer_overflow`, discards the buffer, and requires a fresh sync; it never emits a partial snapshot. A disconnected connection discards its buffer. Contract tests inject events before, during, and after the barrier and prove no transition is lost or applied twice.
+Each connection buffer is bounded by both event count and serialized bytes. Overflow fails the in-progress sync with `sync_buffer_overflow`, discards the buffer, and requires a fresh `app.sync`; it never emits a partial snapshot. `session.sync` is only a navigation/explicit-inspection read and never returns or advances the global watermark. A disconnected connection discards its buffer. Contract tests inject events before, during, and after the barrier and prove no transition is lost or applied twice.
 
 ## Projection model
 
@@ -220,7 +222,7 @@ Workspace
         └── Terminal state
 ```
 
-One Pi model-response/tool-loop unit maps to an Assistant Step, not a Product Turn. Blocks preserve source order. Tool declarations and executions join by the SDK's `toolCallId`; parallel completion order never reorders their declared source positions. Stable keys survive the final replacement of a streaming block so disclosure state, Inspector selection, and scroll anchors remain intact.
+One Pi model-response/tool-loop unit maps to an Assistant Step, not a Product Turn. Blocks preserve source order. Tool declaration has dedicated start(name), arguments-fragment delta, and parsed-arguments/error settlement events; a preparing Tool Block does not require complete presenter details. Declaration and execution join by the SDK's `toolCallId`, so parallel completion order never reorders declared source positions. Stable keys survive final replacement so disclosure state, Inspector selection, and scroll anchors remain intact.
 
 The active view contains two layers:
 
@@ -291,22 +293,22 @@ The module interface is the test surface.
 
 - Shared schema fixtures are accepted identically by Host and Web.
 - Tests cover version negotiation, strict validation, correlation, frame limits, unknown messages, Origin rejection, sequence gaps, and reconnect.
-- Bootstrap/sync tests place events on both sides of the sequence barrier, assert the atomic `snapshotSeq`, exercise buffering and overflow, discard duplicates, and reject stale runtime epochs.
+- Bootstrap/app-sync tests place events on both sides of the global sequence barrier, assert the atomic `snapshotSeq`, exercise buffering and overflow, discard duplicates, and reject stale runtime epochs. Session-sync tests prove it cannot advance the global watermark.
 
 ### Projection
 
-- Golden event traces cover Product Turn/Assistant Step grouping, stable keys, final replacement, tool identity, interrupted partials, errors, and unknown fallbacks.
+- Golden event traces cover Product Turn/Assistant Step grouping, stable keys, final replacement, tool declaration fragments, `toolCallId` execution identity, interrupted display reasons, errors, and unknown fallbacks.
 - Tests assert observable projections rather than projector internals.
 
 ### Command Ledger
 
-- Duplicate identifiers, minimum Run envelope linkage, durability ordering, delivery/outcome unknown separation, risk acknowledgement, every terminal transition, restart priority, truncated tails, and explicit new mutation receive deterministic tests.
+- Duplicate identifiers, receipt scope, local committed/failed paths, Prompt-only Run envelope linkage, delivery/outcome unknown separation, scope-aware acknowledgement, restart priority, truncated tails, and explicit new mutation receive deterministic tests.
 - A fault-injection test kills the Host at each durability boundary and proves it never automatically invokes the same mutation twice.
 
 ### Recovery and browser paths
 
 - Host integration tests reopen Sessions and reconcile active/committed state.
-- Playwright covers refresh, WebSocket loss, Host kill/restart, read-only inspection of another Session, exact-run Stop, next-Run settings, theme persistence, trash/list/restore, long content, and the real file-edit path.
+- Playwright covers refresh, full app sync after WebSocket loss, Host kill/restart unknown classifications, read-only inspection of another Session, exact-run Stop, next-Run settings, theme persistence, active-session trash fallback/rollback, trash restore, long content, and the real file-edit path.
 - Preference tests cover bootstrap, update, broadcast, atomic persistence, invalid values, and restart for all three theme preferences.
 - Workspace tests cover missing paths, non-directories, permission failures, symlink/canonical duplicates, display-name update, and removal without deletion.
 - Keyboard, IME, Light/Dark, reduced motion, and desktop screenshots form release evidence.

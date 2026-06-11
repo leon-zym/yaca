@@ -45,11 +45,11 @@ The still-changing view of a live Run before its content is reconciled into a Co
 _Avoid_: Draft response, streaming message
 
 **Command Receipt**:
-The Host's durable record of whether a state-changing command was recorded, accepted, or reached a terminal outcome.
+The Host's durable, scoped record of whether a state-changing command was recorded and reached the outcome appropriate to its Host, Workspace, Session, or Run scope.
 _Avoid_: Event, response
 
 **Unknown Delivery**:
-A terminal command outcome in which the Host cannot prove that the coding-agent runtime accepted the command.
+A terminal command outcome in which intent is durable but the Host cannot prove that the intended local change committed or that a Prompt was accepted.
 _Avoid_: Failed, pending
 
 **Outcome Unknown**:

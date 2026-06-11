@@ -37,7 +37,7 @@ The Conversation is the last column to surrender width. As space contracts, the 
 
 The Sidebar groups Sessions by Workspace and makes four states visible without relying on color: active, running, failed/interrupted, and idle. A Session inspected during another Run is selected for reading but is not labeled Active Session. The header must keep this distinction explicit. Workspace menus support a display-name edit that never implies a filesystem rename.
 
-A separate Trash view lists Trashed Sessions with original Workspace, title, and removal time. Restore is the only trash action in the MVP. The view explains that yaca retains entries until the user manually clears its trash directory; it offers no permanent-delete control.
+A separate Trash view lists Trashed Sessions with original Workspace, title, and removal time. Restore is the only trash action in the MVP. The view explains that yaca retains entries until the user manually clears its trash directory; it offers no permanent-delete control. Trashing the Active Session is unavailable while running/stopping; idle success selects the most recent surviving same-Workspace Session or the empty state.
 
 The Inspector remains mounted while temporarily closed so disclosure, scroll, and selection survive layout toggles. Switching the inspected Session clears tool selection from the previous Session.
 
@@ -96,9 +96,9 @@ draft → awaiting acknowledgement → accepted → running → terminal
                                   └─ terminal unproven ─→ Outcome Unknown
 ```
 
-Reconnect atomically installs the Host snapshot and event watermark before applying buffered events. It discards duplicate sequences, resyncs on a gap or runtime-epoch mismatch, and never automatically resends the Prompt.
+Reconnect atomically installs the full `app.sync` Host snapshot and global event watermark before applying buffered events. It discards duplicate sequences, uses another app sync on a gap or runtime-epoch mismatch, and never automatically resends the Prompt. Opening one Session never advances that watermark.
 
-Unknown Delivery explains that SDK acceptance could not be proven. Outcome Unknown explains that acceptance is proven but the terminal result is not. Both warn that side effects may already exist, require the user to inspect the Session and Workspace, and expose an explicit `Acknowledge risk` action. A new side-effecting command remains unavailable until acknowledgement and a fresh sync; a new Prompt then receives a new mutation identity.
+Unknown Delivery explains that a durable local mutation intent may not have committed, or that Prompt acceptance could not be proven. Outcome Unknown explains that Prompt acceptance is proven but the terminal result is not; after restart the UI may explain the interruption without relabeling the receipt as interrupted. Both expose an explicit `Acknowledge risk` action after full app sync. Blocking and acknowledgement follow the receipt's Host, Workspace, Session, or Run scope; a new Prompt receives a new mutation identity.
 
 Empty and failure surfaces occupy the real shell rather than a demo layout. The same Conversation and Composer trees remain mounted when moving from empty Session to active Run.
 
@@ -108,7 +108,7 @@ Thinking is a compact disclosure row in original block order. While streaming, i
 
 Tool Calls are first-class blocks, not Markdown. Declaration and execution are separate states:
 
-- `preparing`: the model is producing the tool name or arguments;
+- `preparing`: a dedicated declaration stream has supplied tool name and zero or more argument fragments; parsed arguments and presenter details may still be absent;
 - `running`: the Host has started execution;
 - `succeeded`, `failed`, or `aborted`: execution is terminal.
 
@@ -143,7 +143,7 @@ Keyboard behavior:
 - Menu selection does not blur the textarea before activation.
 - Primary controls remain reachable in logical Tab order.
 
-Submission is transactional from the user's perspective. One activation creates one mutation identity, enters `awaiting acknowledgement`, and disables duplicate submission. The Host receipt determines `accepted`; a WebSocket acknowledgement alone is not fabricated as acceptance.
+Submission is transactional from the user's perspective. One activation creates one mutation identity, enters `awaiting acknowledgement`, and disables duplicate submission. Only a Prompt receipt uses `accepted`; local actions display committed or failed. A WebSocket acknowledgement alone is never fabricated as either outcome.
 
 While a Run is active, the active Composer exposes Stop and allows editing the next draft but cannot submit another Prompt. Stop is bound to the visible `runId`; stale UI state receives a mismatch error instead of stopping a newer Run. When the user inspects another Session, its committed history remains interactive for reading, while the Composer explains that Prompts continue to target only the Active Session or requires returning to it.
 

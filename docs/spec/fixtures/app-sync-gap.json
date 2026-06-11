@@ -1,0 +1,83 @@
+{
+  "name": "global gap recovers only through app sync",
+  "clientLastApplied": 5,
+  "observedGap": {
+    "v": 1,
+    "connectionSeq": 7,
+    "type": "workspace.changed",
+    "workspaceId": "workspace-1",
+    "sessionId": null,
+    "sessionVersion": null,
+    "runtimeEpoch": null,
+    "runId": null,
+    "runSeq": null,
+    "payload": {
+      "change": "updated",
+      "directoryRevision": "directory-7",
+      "workspaceId": "workspace-1",
+      "workspace": null
+    }
+  },
+  "syncCommand": {
+    "v": 1,
+    "requestId": "request-sync-1",
+    "type": "app.sync",
+    "clientMutationId": null,
+    "sessionId": null,
+    "expectedSessionVersion": null,
+    "payload": {
+      "knownSnapshotSeq": 5,
+      "knownRuntimeEpoch": null
+    }
+  },
+  "syncResponse": {
+    "v": 1,
+    "requestId": "request-sync-1",
+    "ok": true,
+    "result": {
+      "snapshotSeq": 7,
+      "directoryRevision": "directory-7",
+      "trashRevision": "trash-1",
+      "theme": {
+        "themePreference": "light",
+        "updatedAt": "2026-08-19T03:01:00.000Z"
+      },
+      "workspaces": [],
+      "selectedWorkspaceId": null,
+      "sessions": [],
+      "trash": [],
+      "trashCursor": null,
+      "activeSessionId": null,
+      "activeSync": null,
+      "modelCatalog": {
+        "revision": "models-1",
+        "models": []
+      },
+      "desiredSettings": null,
+      "recentReceipts": [],
+      "degraded": null
+    }
+  },
+  "bufferedEvent": {
+    "v": 1,
+    "connectionSeq": 8,
+    "type": "app.theme_changed",
+    "workspaceId": null,
+    "sessionId": null,
+    "sessionVersion": null,
+    "runtimeEpoch": null,
+    "runId": null,
+    "runSeq": null,
+    "payload": {
+      "theme": {
+        "themePreference": "dark",
+        "updatedAt": "2026-08-19T03:01:00.020Z"
+      }
+    }
+  },
+  "expect": {
+    "installedSnapshotSeq": 7,
+    "nextAcceptedConnectionSeq": 8,
+    "sessionSyncAllowedToAdvanceWatermark": false
+  }
+}

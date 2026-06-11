@@ -1,0 +1,113 @@
+{
+  "name": "idle active-session trash selects fallback before directory removal event",
+  "runningRejection": {
+    "v": 1,
+    "requestId": "request-trash-running",
+    "ok": false,
+    "error": {
+      "code": "session_busy",
+      "message": "The Active Session cannot be trashed while its Run is active.",
+      "retryDisposition": "explicit"
+    }
+  },
+  "idleCommand": {
+    "v": 1,
+    "requestId": "request-trash-idle",
+    "type": "session.trash",
+    "clientMutationId": "mutation-trash-1",
+    "sessionId": "session-active",
+    "expectedSessionVersion": "version-active",
+    "payload": {}
+  },
+  "idleResponse": {
+    "v": 1,
+    "requestId": "request-trash-idle",
+    "ok": true,
+    "result": {
+      "receipt": {
+        "receiptId": "receipt-trash-1",
+        "clientMutationId": "mutation-trash-1",
+        "commandType": "session.trash",
+        "scope": "session",
+        "state": "committed",
+        "workspaceId": "workspace-1",
+        "sessionId": "session-active",
+        "runId": null,
+        "productTurnId": null,
+        "riskAcknowledgement": "not_required",
+        "recordedAt": "2026-08-19T03:04:00.000Z",
+        "acceptedAt": null,
+        "terminalAt": "2026-08-19T03:04:00.020Z",
+        "acknowledgedAt": null,
+        "error": null
+      },
+      "trash": {
+        "trashId": "trash-1",
+        "originalSessionId": "session-active",
+        "workspaceId": "workspace-1",
+        "title": "Active work",
+        "originalSessionVersion": "version-active",
+        "trashedAt": "2026-08-19T03:04:00.015Z",
+        "restorable": true,
+        "restoreBlockedReason": null
+      },
+      "activeSessionId": "session-fallback",
+      "runtimeEpoch": "epoch-after-trash"
+    }
+  },
+  "events": [
+    {
+      "v": 1,
+      "connectionSeq": 50,
+      "type": "active_session.changed",
+      "workspaceId": "workspace-1",
+      "sessionId": "session-fallback",
+      "sessionVersion": "version-fallback",
+      "runtimeEpoch": "epoch-after-trash",
+      "runId": null,
+      "runSeq": null,
+      "payload": {
+        "previousSessionId": "session-active",
+        "activeSessionId": "session-fallback",
+        "runtimeEpoch": "epoch-after-trash",
+        "sessionVersion": "version-fallback"
+      }
+    },
+    {
+      "v": 1,
+      "connectionSeq": 51,
+      "type": "session.directory_changed",
+      "workspaceId": "workspace-1",
+      "sessionId": "session-active",
+      "sessionVersion": null,
+      "runtimeEpoch": null,
+      "runId": null,
+      "runSeq": null,
+      "payload": {
+        "change": "trashed",
+        "directoryRevision": "directory-after-trash",
+        "trashRevision": "trash-after-trash",
+        "sessionId": "session-active",
+        "session": null,
+        "trash": {
+          "trashId": "trash-1",
+          "originalSessionId": "session-active",
+          "workspaceId": "workspace-1",
+          "title": "Active work",
+          "originalSessionVersion": "version-active",
+          "trashedAt": "2026-08-19T03:04:00.015Z",
+          "restorable": true,
+          "restoreBlockedReason": null
+        }
+      }
+    }
+  ],
+  "expect": {
+    "fallbackPolicy": "most_recent_surviving_same_workspace",
+    "eventOrder": [
+      "active_session.changed",
+      "session.directory_changed"
+    ],
+    "failureAfterDispose": "restore-and-reopen-original-with-new-epoch-or-degrade"
+  }
+}

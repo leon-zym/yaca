@@ -1,0 +1,79 @@
+{
+  "name": "restart separates unproven acceptance from unproven terminal outcome",
+  "recordedPromptAfterRestart": {
+    "receiptId": "receipt-prompt-1",
+    "clientMutationId": "mutation-prompt-1",
+    "commandType": "run.prompt",
+    "scope": "run",
+    "state": "delivery_unknown",
+    "workspaceId": "workspace-1",
+    "sessionId": "session-1",
+    "runId": "run-1",
+    "productTurnId": "turn-1",
+    "riskAcknowledgement": "required",
+    "recordedAt": "2026-08-19T03:02:00.000Z",
+    "acceptedAt": null,
+    "terminalAt": "2026-08-19T03:03:00.000Z",
+    "acknowledgedAt": null,
+    "error": {
+      "code": "command_delivery_unknown",
+      "message": "Prompt acceptance could not be proven after Host restart.",
+      "retryDisposition": "explicit"
+    }
+  },
+  "acceptedPromptAfterRestart": {
+    "receipt": {
+      "receiptId": "receipt-prompt-2",
+      "clientMutationId": "mutation-prompt-2",
+      "commandType": "run.prompt",
+      "scope": "run",
+      "state": "outcome_unknown",
+      "workspaceId": "workspace-1",
+      "sessionId": "session-1",
+      "runId": "run-2",
+      "productTurnId": "turn-2",
+      "riskAcknowledgement": "required",
+      "recordedAt": "2026-08-19T03:02:10.000Z",
+      "acceptedAt": "2026-08-19T03:02:10.010Z",
+      "terminalAt": "2026-08-19T03:03:00.000Z",
+      "acknowledgedAt": null,
+      "error": {
+        "code": "command_outcome_unknown",
+        "message": "Accepted Prompt has no durable terminal outcome after Host restart.",
+        "retryDisposition": "explicit"
+      }
+    },
+    "run": {
+      "runId": "run-2",
+      "productTurnId": "turn-2",
+      "workspaceId": "workspace-1",
+      "sessionId": "session-1",
+      "promptReceiptId": "receipt-prompt-2",
+      "promptClientMutationId": "mutation-prompt-2",
+      "runtimeEpoch": "epoch-before-restart",
+      "baseSessionVersion": "version-1",
+      "baseLeafEntryId": null,
+      "settings": {
+        "model": {
+          "providerId": "deepseek",
+          "modelId": "deepseek-chat"
+        },
+        "thinkingLevel": "low"
+      },
+      "status": "outcome_unknown",
+      "acceptedAt": "2026-08-19T03:02:10.010Z",
+      "terminalAt": "2026-08-19T03:03:00.000Z",
+      "terminalError": {
+        "code": "command_outcome_unknown",
+        "message": "Accepted Prompt has no durable terminal outcome after Host restart.",
+        "retryDisposition": "explicit"
+      },
+      "interruptionReason": "host_restart"
+    }
+  },
+  "expect": {
+    "recordedState": "delivery_unknown",
+    "acceptedState": "outcome_unknown",
+    "acceptedStateMustNotBecome": "interrupted"
+  }
+}
