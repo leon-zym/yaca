@@ -49,8 +49,12 @@ The Host's durable record of whether a state-changing command was recorded, acce
 _Avoid_: Event, response
 
 **Unknown Delivery**:
-A terminal command outcome in which the Host cannot prove whether the coding-agent runtime accepted the command before interruption.
+A terminal command outcome in which the Host cannot prove that the coding-agent runtime accepted the command.
 _Avoid_: Failed, pending
+
+**Outcome Unknown**:
+A terminal command outcome in which runtime acceptance is proven but completion, failure, or abort cannot be proven after interruption.
+_Avoid_: Unknown Delivery, failed
 
 **Desired Setting**:
 A model or Thinking Level selection recorded for the next Run without changing a Run already in progress.
@@ -59,3 +63,7 @@ _Avoid_: Current model, live setting
 **Content Reference**:
 An opaque, authorized reference to complete content that is too large for the realtime protocol.
 _Avoid_: File path, blob URL
+
+**Trashed Session**:
+A recoverable Session removed from the active Session catalog and retained until the user manually clears it.
+_Avoid_: Deleted Session, archived Session

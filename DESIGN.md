@@ -35,7 +35,9 @@ The Conversation is the last column to surrender width. As space contracts, the 
 └─────────────────┴──────────────────────────────────┴─────────────────┘
 ```
 
-The Sidebar groups Sessions by Workspace and makes four states visible without relying on color: active, running, failed/interrupted, and idle. A Session inspected during another Run is selected for reading but is not labeled Active Session. The header must keep this distinction explicit.
+The Sidebar groups Sessions by Workspace and makes four states visible without relying on color: active, running, failed/interrupted, and idle. A Session inspected during another Run is selected for reading but is not labeled Active Session. The header must keep this distinction explicit. Workspace menus support a display-name edit that never implies a filesystem rename.
+
+A separate Trash view lists Trashed Sessions with original Workspace, title, and removal time. Restore is the only trash action in the MVP. The view explains that yaca retains entries until the user manually clears its trash directory; it offers no permanent-delete control.
 
 The Inspector remains mounted while temporarily closed so disclosure, scroll, and selection survive layout toggles. Switching the inspected Session clears tool selection from the previous Session.
 
@@ -90,10 +92,13 @@ Connection and command state remain visible:
 
 ```text
 draft → awaiting acknowledgement → accepted → running → terminal
-                                  └───────────────→ Unknown Delivery
+        └─ acceptance unproven ────────────────→ Unknown Delivery
+                                  └─ terminal unproven ─→ Outcome Unknown
 ```
 
-Reconnect reconciles receipts and the Session snapshot. It never automatically resends the Prompt. Unknown Delivery uses a distinct warning that explains side effects may already exist; an explicit new submission is the only retry.
+Reconnect atomically installs the Host snapshot and event watermark before applying buffered events. It discards duplicate sequences, resyncs on a gap or runtime-epoch mismatch, and never automatically resends the Prompt.
+
+Unknown Delivery explains that SDK acceptance could not be proven. Outcome Unknown explains that acceptance is proven but the terminal result is not. Both warn that side effects may already exist, require the user to inspect the Session and Workspace, and expose an explicit `Acknowledge risk` action. A new side-effecting command remains unavailable until acknowledgement and a fresh sync; a new Prompt then receives a new mutation identity.
 
 Empty and failure surfaces occupy the real shell rather than a demo layout. The same Conversation and Composer trees remain mounted when moving from empty Session to active Run.
 
@@ -111,9 +116,9 @@ The compact Tool Row contains status, tool name, one factual summary, and an Ins
 
 Dedicated presenters:
 
-- **Read**: Workspace-relative display path, requested range, preview, truncation, and complete text when available.
-- **Edit/Write**: path, patch or unified diff, additions/deletions, and a clear failure if the diff cannot be proven.
-- **Shell**: exact command, streaming output preview, exit code or signal, duration, truncation, and complete output when available.
+- **Read**: Workspace-relative display path, requested range, preview, truncation, and Host-retained complete text. It does not imply an SDK full-output file exists.
+- **Edit/Write**: path, patch or unified diff, additions/deletions, and a Content Reference for a large diff.
+- **Shell**: exact command, streaming output preview, exit code or signal, duration, truncation, and Host-retained complete output copied from the SDK's temporary path when needed.
 - **Unknown**: tool name, safe formatted input, status, output preview, error, and complete content. An unknown tool never disappears or crashes the Turn.
 
 The Inspector header names the selected Tool Call and its owning Session. It exposes complete input/output, structured details, diff, and Content Reference state. It never accepts an arbitrary file path from the browser.
@@ -140,9 +145,9 @@ Keyboard behavior:
 
 Submission is transactional from the user's perspective. One activation creates one mutation identity, enters `awaiting acknowledgement`, and disables duplicate submission. The Host receipt determines `accepted`; a WebSocket acknowledgement alone is not fabricated as acceptance.
 
-While a Run is active, the active Composer exposes Stop and allows editing the next draft but cannot submit another Prompt. When the user inspects another Session, its committed history remains interactive for reading, while the Composer explains that Prompts continue to target only the Active Session or requires returning to it.
+While a Run is active, the active Composer exposes Stop and allows editing the next draft but cannot submit another Prompt. Stop is bound to the visible `runId`; stale UI state receives a mismatch error instead of stopping a newer Run. When the user inspects another Session, its committed history remains interactive for reading, while the Composer explains that Prompts continue to target only the Active Session or requires returning to it.
 
-Session create, activate, rename, trash, Workspace registration, and Workspace removal use real commands. Destructive Session removal uses an Alert Dialog and describes recoverable trash behavior. Workspace removal states that Workspace files and Sessions are not deleted.
+Session create, activate, rename, trash, trash list/restore, Workspace registration, Workspace display-name update, and Workspace removal use real commands. Session removal uses an Alert Dialog and describes indefinite recoverable retention. Workspace removal states that Workspace files, Sessions, and Trashed Sessions are not deleted.
 
 Slash commands, attachments, queueing, steering, follow-up, retry, and extension-contributed controls are absent from the MVP shell.
 
@@ -157,7 +162,7 @@ The selector has two keyboard-operable levels:
 
 During a Run, selection updates Desired Settings. The UI labels the result `Applies to next run`. After the Run settles, the Host applies valid Desired Settings before accepting the next Prompt and reports the application state. A failed selection preserves the last accepted Desired Setting and shows a nearby structured error.
 
-No fixed UI list may imply that every model supports `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. The list comes from validated Host capabilities. If capability validation cannot prove a level, it is omitted.
+No fixed UI list may imply that every model supports `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. The list comes from that model's Host catalog entry. The currently validated DeepSeek entry displays exactly `off`, `low`, `high`, and `max`; runtime clamping never appears as another choice.
 
 Provider credentials never enter this UI. An unavailable credential produces an actionable Host error without revealing secret material.
 
@@ -173,7 +178,7 @@ Required semantics:
 - Disabled controls remain explainable by adjacent text or accessible description.
 - Focus is never trapped behind a closed Inspector or overlay.
 
-Light and Dark themes share semantic tokens rather than component-specific colors. Theme preference is Host-owned yaca state under `~/.yaca/`; the browser may use the system preference before bootstrap but reconciles to Host state.
+Light and Dark themes share semantic tokens rather than component-specific colors. The Settings control writes a Host-owned `system`, `light`, or `dark` preference. Before bootstrap, the browser may use the system preference only to avoid a blank or flashing shell; bootstrap atomically applies the persisted Host value, and update events keep multiple tabs consistent. Restart acceptance proves persistence under `~/.yaca/`.
 
 `prefers-reduced-motion` removes sweep, large panel interpolation, and nonessential fades. State changes remain visible without animation. Normal motion uses short, consistent transitions and never animates token-by-token layout.
 
@@ -198,7 +203,7 @@ Use system sans with Chinese-capable fallbacks and a clear mono stack for code a
 
 Acceptance evidence includes:
 
-- Light and Dark screenshots of empty Session, streaming thinking, multi-step tool loop, edit diff, shell output, error, Unknown Delivery, and read-only Session inspection;
+- Light and Dark screenshots of empty Session, streaming thinking, multi-step tool loop, edit diff, shell output, error, Unknown Delivery, Outcome Unknown, Trash restore, and read-only Session inspection;
 - reduced-motion capture proving state remains legible without animation;
 - keyboard and screen-reader checks for navigation, Composer, Thinking, Tool Row, Inspector, model selection, dialogs, and Stop;
 - long-content evidence at preview and complete-content boundaries;
