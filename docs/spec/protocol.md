@@ -446,6 +446,7 @@ DegradedView = {
 SessionCatalogPage = {
   workspaceId: OpaqueId,
   catalogRevision: OpaqueId,
+  appliedLimit: integer{1..200},
   sessions: SessionSummary[0..200],
   nextCursor: Cursor | null
 }
@@ -453,6 +454,7 @@ SessionCatalogPage = {
 TrashCatalogPage = {
   workspaceId: OpaqueId | null,
   catalogRevision: OpaqueId,
+  appliedLimit: integer{1..200},
   entries: TrashRecord[0..200],
   nextCursor: Cursor | null
 }
@@ -480,7 +482,7 @@ SessionSyncResult = {
 AppSyncResult = BootstrapResult
 ```
 
-`selectedSessionCatalog` is null exactly when `selectedWorkspaceId` is null; otherwise its `workspaceId` equals `selectedWorkspaceId`. `trashCatalog.workspaceId` is null because bootstrap and app sync return the first global trash page. Only `BootstrapResult`/`AppSyncResult.snapshotSeq` is an atomic connection-global watermark, defined in section 10. `SessionSyncResult` is a navigation read and never advances the event sequence baseline.
+`selectedSessionCatalog` is null exactly when `selectedWorkspaceId` is null; otherwise its `workspaceId` equals `selectedWorkspaceId`. `trashCatalog.workspaceId` is null because bootstrap and app sync return the first global trash page. Every page contains at most `appliedLimit` entries; bootstrap, app sync, and `workspace.select` use and report the default 50. Only `BootstrapResult`/`AppSyncResult.snapshotSeq` is an atomic connection-global watermark, defined in section 10. `SessionSyncResult` is a navigation read and never advances the event sequence baseline.
 
 ## 5. Handshake and envelopes
 
@@ -567,7 +569,7 @@ FirstSessionCatalogPageRequest = {
 
 ContinueSessionCatalogPageRequest = {
   workspaceId: OpaqueId,
-  limit: integer{1..200},
+  appliedLimit: integer{1..200},
   catalogRevision: OpaqueId,
   cursor: Cursor
 }
@@ -582,7 +584,7 @@ FirstTrashCatalogPageRequest = {
 
 ContinueTrashCatalogPageRequest = {
   workspaceId: OpaqueId | null,
-  limit: integer{1..200},
+  appliedLimit: integer{1..200},
   catalogRevision: OpaqueId,
   cursor: Cursor
 }
@@ -591,7 +593,7 @@ TrashCatalogPageRequest = FirstTrashCatalogPageRequest |
                           ContinueTrashCatalogPageRequest
 ```
 
-A first page omits both `catalogRevision` and `cursor`; a continuation includes both. Supplying only one is schema-invalid.
+A first page omits both `catalogRevision` and `cursor` and requests `limit`; every page response reports the actual `appliedLimit`. A continuation includes `catalogRevision`, `cursor`, and the prior response's `appliedLimit`. Supplying only part of that continuation triple is schema-invalid.
 
 | Command type | Kind | Envelope scope | Exact payload | Exact success result |
 |---|---|---|---|---|
@@ -647,7 +649,8 @@ This table is exhaustive for `MutationCommandType`; implementations MUST fail sc
 Command invariants:
 
 - `app.bootstrap` and `app.sync` execute through the global atomic snapshot barrier. `session.sync` is a navigation/inspection read and MUST NOT pause global delivery, change `lastApplied`, or supply a `snapshotSeq`.
-- Every first Session/Trash catalog response returns its current opaque `catalogRevision` and `nextCursor`. A continuation cursor is valid only with the same revision, catalog kind, Workspace filter, sort, and limit encoded by that cursor. If the current catalog changed, the Host returns `stale_catalog_revision`; the client discards every page for that catalog and starts again without cursor or revision. A successful continuation echoes the requested revision. `session.sync` neither returns nor changes a catalog revision.
+- Every first Session/Trash catalog response returns its current opaque `catalogRevision`, actual `appliedLimit`, and `nextCursor`. A continuation cursor is valid only with the same revision, catalog kind, Workspace filter, sort, and `appliedLimit` encoded by that cursor. A continuation MUST echo that `appliedLimit`; mismatch returns `invalid_cursor`. If the current catalog changed, the Host returns `stale_catalog_revision`. `session.sync` neither returns nor changes a catalog revision.
+- For each Session catalog identity (`workspaceId`) and Trash catalog identity (`workspaceId` filter or global null), Web maintains `currentObservedRevision`. A catalog-changing event first replaces that value with the event's revision and invalidates all pages from the prior revision. A first-page, continuation, `workspace.select`, bootstrap, or `app.sync` page is applied only when its `catalogRevision` equals `currentObservedRevision`; on mismatch Web discards the entire response page, preserves the observed revision, and refetches from the first page. If no revision has yet been observed, the first page response establishes it. A response MUST NOT overwrite a different observed revision.
 - `app.setThemePreference` reaches atomic persistence before success and emits `app.theme_changed` to all connected clients.
 - `workspace.register` canonicalizes the path, then requires existence, directory type, read/search/write permission, and uniqueness by canonical identity.
 - `workspace.updateDisplayName` changes no filesystem path.
@@ -860,7 +863,7 @@ workspace_path_unwritable | workspace_duplicate |
 workspace_display_name_invalid | workspace_in_use |
 
 session_not_found | session_busy | stale_session_version |
-stale_catalog_revision |
+invalid_cursor | stale_catalog_revision |
 trash_not_found | session_restore_conflict | session_restore_workspace_missing |
 
 run_not_active | run_mismatch | receipt_not_found |
@@ -879,7 +882,7 @@ Stable retry dispositions:
 |---|---|
 | schema, protocol, auth, invalid path/name | `never` |
 | stale version, gap, epoch mismatch | `after_sync` |
-| stale Session/Trash catalog continuation | `restart_catalog` |
+| stale or invalid Session/Trash catalog continuation | `restart_catalog` |
 | busy, restore conflict, model/provider, unknown delivery/outcome | `explicit` |
 | storage failure, SDK incompatibility | `never` until Host state changes |
 
@@ -890,6 +893,7 @@ Specific invariants:
 - Abort identity mismatch returns `run_mismatch` with safe `activeRunId` detail.
 - Unknown receipt state blocks mutation with `unresolved_command_outcome` and the blocking `receiptId`.
 - A valid continuation cursor whose bound revision is no longer current returns `stale_catalog_revision`; the response exposes no replacement cursor or page.
+- A cursor used with a different catalog identity, filter, sort, or `appliedLimit` returns `invalid_cursor`.
 - `command_delivery_unknown` describes unproven local commit or Prompt acceptance; `command_outcome_unknown` describes proven Prompt acceptance with unproven terminal result.
 
 ## 10. Atomic sync watermark
@@ -972,7 +976,7 @@ Host and Web independently generate fixtures from the schemas above. The shared 
 - one generated fixture row for every mutation in the exhaustive authority table, asserting its sole `ReceiptScope`, exact `authorityId`, required/null lineage, and no duplicate or missing mapping; Host/Workspace/Session/Run-scoped non-Prompt receipts cover `recorded → committed | failed | delivery_unknown`;
 - Prompt receipt paths for terminal success/failure/abort, `delivery_unknown`, `outcome_unknown`, scope-aware risk acknowledgement, and post-acknowledgement new mutation;
 - minimum Run envelope linkage across receipt, Product Turn, Session, Run, base version, settings, and runtime epoch;
-- first and continuation Session/Trash catalog pages, same-revision echo, cursor filter binding, concurrent revision change returning `stale_catalog_revision`, client page discard/restart, revision-bearing catalog events, and proof that `session.sync` neither returns nor changes a catalog revision;
+- first and continuation Session/Trash catalog pages with `appliedLimit`, same-revision/limit echo, cursor filter binding, invalid limit echo, concurrent revision change returning `stale_catalog_revision`, event-before-response page rejection without observed-revision rollback, client page discard/restart, revision-bearing catalog events, and proof that `session.sync` neither returns nor changes a catalog revision;
 - full `app.sync` snapshots with events immediately before, during, and after the barrier, duplicate events, gaps, epoch mismatch, buffer overflow, and reconnect; `session.sync` fixtures prove it never advances the global watermark;
 - a DeepSeek catalog fixture with exactly `off`, `low`, `high`, and `max`, plus rejection of unsupported levels;
 - Tool declaration start with every deterministic initial `ToolBlock` field, serial argument fragments, exact 65,536-byte UTF-8 truncation, missing/mismatched-target rejection, complete settled block with safe parsed arguments or error, Content Reference fallback, and parallel Tool Calls whose execution completion order differs from declaration order but remains joined by `toolCallId`;
