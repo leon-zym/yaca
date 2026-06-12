@@ -1,6 +1,39 @@
 {
   "name": "global gap recovers only through app sync",
   "clientLastApplied": 5,
+  "clientCatalogBeforeSync": {
+    "workspaceId": "workspace-1",
+    "currentObservedRevision": "sessions-7"
+  },
+  "missedCatalogEvent": {
+    "v": 1,
+    "connectionSeq": 6,
+    "type": "session.directory_changed",
+    "workspaceId": "workspace-1",
+    "sessionId": "session-1",
+    "sessionVersion": "version-2",
+    "runtimeEpoch": null,
+    "runId": null,
+    "runSeq": null,
+    "payload": {
+      "change": "renamed",
+      "sessionCatalogRevision": "sessions-8",
+      "trashCatalogRevision": "trash-1",
+      "sessionId": "session-1",
+      "session": {
+        "sessionId": "session-1",
+        "workspaceId": "workspace-1",
+        "title": "Renamed while disconnected",
+        "sessionVersion": "version-2",
+        "createdAt": "2026-08-19T02:10:00.000Z",
+        "updatedAt": "2026-08-19T03:00:58.000Z",
+        "active": false,
+        "unreadTerminal": false,
+        "lastRunStatus": null
+      },
+      "trash": null
+    }
+  },
   "observedGap": {
     "v": 1,
     "connectionSeq": 7,
@@ -63,16 +96,16 @@
       "selectedWorkspaceId": "workspace-1",
       "selectedSessionCatalog": {
         "workspaceId": "workspace-1",
-        "catalogRevision": "sessions-7",
+        "catalogRevision": "sessions-8",
         "appliedLimit": 50,
         "sessions": [
           {
             "sessionId": "session-1",
             "workspaceId": "workspace-1",
-            "title": "First page",
-            "sessionVersion": "version-1",
+            "title": "Renamed while disconnected",
+            "sessionVersion": "version-2",
             "createdAt": "2026-08-19T02:10:00.000Z",
-            "updatedAt": "2026-08-19T02:20:00.000Z",
+            "updatedAt": "2026-08-19T03:00:58.000Z",
             "active": false,
             "unreadTerminal": false,
             "lastRunStatus": null
@@ -98,40 +131,26 @@
       "degraded": null
     }
   },
-  "sessionContinuationRequestA": {
-    "v": 1,
-    "requestId": "request-sessions-2",
-    "type": "session.list",
-    "clientMutationId": null,
-    "sessionId": null,
-    "expectedSessionVersion": null,
-    "payload": {
-      "workspaceId": "workspace-1",
-      "appliedLimit": 50,
-      "catalogRevision": "sessions-7",
-      "cursor": "sessions-page-2"
-    }
-  },
-  "catalogChangingEventB": {
+  "bufferedCatalogEvent": {
     "v": 1,
     "connectionSeq": 8,
     "type": "session.directory_changed",
     "workspaceId": "workspace-1",
     "sessionId": "session-1",
-    "sessionVersion": "version-2",
+    "sessionVersion": "version-3",
     "runtimeEpoch": null,
     "runId": null,
     "runSeq": null,
     "payload": {
       "change": "renamed",
-      "sessionCatalogRevision": "sessions-8",
+      "sessionCatalogRevision": "sessions-9",
       "trashCatalogRevision": "trash-1",
       "sessionId": "session-1",
       "session": {
         "sessionId": "session-1",
         "workspaceId": "workspace-1",
-        "title": "Renamed before page A returned",
-        "sessionVersion": "version-2",
+        "title": "Renamed after sync snapshot",
+        "sessionVersion": "version-3",
         "createdAt": "2026-08-19T02:10:00.000Z",
         "updatedAt": "2026-08-19T03:01:00.030Z",
         "active": false,
@@ -141,44 +160,19 @@
       "trash": null
     }
   },
-  "lateSessionContinuationResponseA": {
-    "v": 1,
-    "requestId": "request-sessions-2",
-    "ok": true,
-    "result": {
-      "workspaceId": "workspace-1",
-      "catalogRevision": "sessions-7",
-      "appliedLimit": 50,
-      "sessions": [
-        {
-          "sessionId": "session-2",
-          "workspaceId": "workspace-1",
-          "title": "Second page",
-          "sessionVersion": "version-2",
-          "createdAt": "2026-08-19T02:30:00.000Z",
-          "updatedAt": "2026-08-19T02:40:00.000Z",
-          "active": false,
-          "unreadTerminal": false,
-          "lastRunStatus": null
-        }
-      ],
-      "nextCursor": null
-    }
-  },
   "expect": {
     "installedSnapshotSeq": 7,
     "nextAcceptedConnectionSeq": 8,
-    "selectedCatalogRevision": "sessions-7",
-    "raceOrder": [
-      "sessionContinuationRequestA",
-      "catalogChangingEventB",
-      "lateSessionContinuationResponseA"
+    "catalogRevisionOrder": [
+      "sessions-7",
+      "sessions-8",
+      "sessions-9"
     ],
-    "eventBObservedRevision": "sessions-8",
-    "lateResponseARevision": "sessions-7",
-    "lateResponseAApplied": false,
-    "revisionAfterLateResponseA": "sessions-8",
-    "staleCatalogAction": "discard_all_pages_and_restart_without_cursor_or_revision",
+    "missedEventAppliedDirectly": false,
+    "syncSnapshotReplacesObservedRevision": true,
+    "syncSnapshotEqualityGateApplied": false,
+    "finalObservedRevision": "sessions-9",
+    "additionalSyncRequired": false,
     "sessionSyncAllowedToAdvanceWatermark": false
   }
 }

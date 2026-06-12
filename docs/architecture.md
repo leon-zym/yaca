@@ -207,7 +207,9 @@ Each connection buffer is bounded by both event count and serialized bytes. Over
 
 Session and trash catalogs use revision-bound opaque cursors. A first page has no cursor or revision and returns the captured catalog revision, actual `appliedLimit`, and next cursor. Every continuation echoes that revision and limit; cursors bind catalog kind, Workspace filter, sort, limit, and revision. A concurrent catalog mutation yields `stale_catalog_revision`, while a mismatched bound limit yields `invalid_cursor`.
 
-For each catalog identity, Web retains `currentObservedRevision`. A catalog-changing event updates it before invalidating old pages. Any later first-page, continuation, workspace-selection, bootstrap, or app-sync page with a different revision is discarded in full and triggers a first-page refetch; it never rolls the observed revision back. The first response establishes the value only when none has been observed. `session.sync` is not a catalog operation and never changes a catalog revision.
+For each catalog identity, Web retains `currentObservedRevision`. A catalog-changing event updates it before invalidating old pages. A later ordinary list or workspace-selection page with a different revision is discarded in full and triggers a first-page refetch; it never rolls the observed revision back. The first ordinary response establishes the value only when none has been observed.
+
+Bootstrap and app sync do not use that equality gate. Their `snapshotSeq` barrier atomically replaces all catalog pages and observed revisions, even when the client previously observed a different revision. Web then applies only buffered events above the installed watermark in sequence, allowing those events to advance revisions. `session.sync` is not a catalog operation and never changes a catalog revision.
 
 ## Projection model
 
@@ -298,7 +300,7 @@ The module interface is the test surface.
 - Shared schema fixtures are accepted identically by Host and Web.
 - Tests cover version negotiation, strict validation, correlation, frame limits, unknown messages, Origin rejection, sequence gaps, and reconnect.
 - Bootstrap/app-sync tests place events on both sides of the global sequence barrier, assert the atomic `snapshotSeq`, exercise buffering and overflow, discard duplicates, and reject stale runtime epochs. Session-sync tests prove it cannot advance the global watermark or alter a catalog revision.
-- Catalog conformance covers first/continuation pairs, `appliedLimit` echo and cursor binding, concurrent invalidation, event-before-response rejection without revision rollback, stale-page discard/restart, and new revisions on Session/trash events.
+- Catalog conformance covers first/continuation pairs, `appliedLimit` echo and cursor binding, ordinary event-before-response rejection without revision rollback, authoritative sync replacement, buffered post-snapshot revision advance without a sync loop, stale-page discard/restart, and new revisions on Session/trash events.
 
 ### Projection
 
