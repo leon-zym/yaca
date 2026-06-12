@@ -5,6 +5,7 @@
     "clientMutationId": "mutation-prompt-1",
     "commandType": "run.prompt",
     "scope": "run",
+    "authorityId": "run-1",
     "state": "delivery_unknown",
     "workspaceId": "workspace-1",
     "sessionId": "session-1",
@@ -27,6 +28,7 @@
       "clientMutationId": "mutation-prompt-2",
       "commandType": "run.prompt",
       "scope": "run",
+      "authorityId": "run-2",
       "state": "outcome_unknown",
       "workspaceId": "workspace-1",
       "sessionId": "session-1",
@@ -72,6 +74,14 @@
     }
   },
   "expect": {
+    "recordedAuthority": {
+      "scope": "run",
+      "authorityId": "run-1"
+    },
+    "acceptedAuthority": {
+      "scope": "run",
+      "authorityId": "run-2"
+    },
     "recordedState": "delivery_unknown",
     "acceptedState": "outcome_unknown",
     "acceptedStateMustNotBecome": "interrupted"

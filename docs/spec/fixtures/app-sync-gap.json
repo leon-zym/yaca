@@ -13,9 +13,17 @@
     "runSeq": null,
     "payload": {
       "change": "updated",
-      "directoryRevision": "directory-7",
+      "workspaceCatalogRevision": "workspaces-7",
       "workspaceId": "workspace-1",
-      "workspace": null
+      "workspace": {
+        "workspaceId": "workspace-1",
+        "displayName": "yaca",
+        "displayPath": "/work/yaca",
+        "selected": true,
+        "available": true,
+        "createdAt": "2026-08-19T02:00:00.000Z",
+        "updatedAt": "2026-08-19T03:00:59.000Z"
+      }
     }
   },
   "syncCommand": {
@@ -36,17 +44,47 @@
     "ok": true,
     "result": {
       "snapshotSeq": 7,
-      "directoryRevision": "directory-7",
-      "trashRevision": "trash-1",
+      "workspaceCatalogRevision": "workspaces-7",
       "theme": {
         "themePreference": "light",
         "updatedAt": "2026-08-19T03:01:00.000Z"
       },
-      "workspaces": [],
-      "selectedWorkspaceId": null,
-      "sessions": [],
-      "trash": [],
-      "trashCursor": null,
+      "workspaces": [
+        {
+          "workspaceId": "workspace-1",
+          "displayName": "yaca",
+          "displayPath": "/work/yaca",
+          "selected": true,
+          "available": true,
+          "createdAt": "2026-08-19T02:00:00.000Z",
+          "updatedAt": "2026-08-19T03:00:59.000Z"
+        }
+      ],
+      "selectedWorkspaceId": "workspace-1",
+      "selectedSessionCatalog": {
+        "workspaceId": "workspace-1",
+        "catalogRevision": "sessions-7",
+        "sessions": [
+          {
+            "sessionId": "session-1",
+            "workspaceId": "workspace-1",
+            "title": "First page",
+            "sessionVersion": "version-1",
+            "createdAt": "2026-08-19T02:10:00.000Z",
+            "updatedAt": "2026-08-19T02:20:00.000Z",
+            "active": false,
+            "unreadTerminal": false,
+            "lastRunStatus": null
+          }
+        ],
+        "nextCursor": "sessions-page-2"
+      },
+      "trashCatalog": {
+        "workspaceId": null,
+        "catalogRevision": "trash-1",
+        "entries": [],
+        "nextCursor": null
+      },
       "activeSessionId": null,
       "activeSync": null,
       "modelCatalog": {
@@ -56,6 +94,43 @@
       "desiredSettings": null,
       "recentReceipts": [],
       "degraded": null
+    }
+  },
+  "sessionContinuationCommand": {
+    "v": 1,
+    "requestId": "request-sessions-2",
+    "type": "session.list",
+    "clientMutationId": null,
+    "sessionId": null,
+    "expectedSessionVersion": null,
+    "payload": {
+      "workspaceId": "workspace-1",
+      "limit": 50,
+      "catalogRevision": "sessions-7",
+      "cursor": "sessions-page-2"
+    }
+  },
+  "sessionContinuationResponse": {
+    "v": 1,
+    "requestId": "request-sessions-2",
+    "ok": true,
+    "result": {
+      "workspaceId": "workspace-1",
+      "catalogRevision": "sessions-7",
+      "sessions": [
+        {
+          "sessionId": "session-2",
+          "workspaceId": "workspace-1",
+          "title": "Second page",
+          "sessionVersion": "version-2",
+          "createdAt": "2026-08-19T02:30:00.000Z",
+          "updatedAt": "2026-08-19T02:40:00.000Z",
+          "active": false,
+          "unreadTerminal": false,
+          "lastRunStatus": null
+        }
+      ],
+      "nextCursor": null
     }
   },
   "bufferedEvent": {
@@ -78,6 +153,9 @@
   "expect": {
     "installedSnapshotSeq": 7,
     "nextAcceptedConnectionSeq": 8,
+    "selectedCatalogRevision": "sessions-7",
+    "continuationEchoedRevision": "sessions-7",
+    "staleCatalogAction": "discard_all_pages_and_restart_without_cursor_or_revision",
     "sessionSyncAllowedToAdvanceWatermark": false
   }
 }

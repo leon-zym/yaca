@@ -29,6 +29,7 @@
         "clientMutationId": "mutation-trash-1",
         "commandType": "session.trash",
         "scope": "session",
+        "authorityId": "session-active",
         "state": "committed",
         "workspaceId": "workspace-1",
         "sessionId": "session-active",
@@ -70,7 +71,8 @@
         "previousSessionId": "session-active",
         "activeSessionId": "session-fallback",
         "runtimeEpoch": "epoch-after-trash",
-        "sessionVersion": "version-fallback"
+        "sessionVersion": "version-fallback",
+        "sessionCatalogRevision": "sessions-after-trash"
       }
     },
     {
@@ -85,8 +87,8 @@
       "runSeq": null,
       "payload": {
         "change": "trashed",
-        "directoryRevision": "directory-after-trash",
-        "trashRevision": "trash-after-trash",
+        "sessionCatalogRevision": "sessions-after-trash",
+        "trashCatalogRevision": "trash-after-trash",
         "sessionId": "session-active",
         "session": null,
         "trash": {
@@ -103,6 +105,10 @@
     }
   ],
   "expect": {
+    "receiptAuthority": {
+      "scope": "session",
+      "authorityId": "session-active"
+    },
     "fallbackPolicy": "most_recent_surviving_same_workspace",
     "eventOrder": [
       "active_session.changed",

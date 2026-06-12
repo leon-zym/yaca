@@ -6,6 +6,7 @@
       "clientMutationId": "mutation-theme-1",
       "commandType": "app.setThemePreference",
       "scope": "host",
+      "authorityId": "app",
       "state": "recorded",
       "workspaceId": null,
       "sessionId": null,
@@ -23,6 +24,7 @@
       "clientMutationId": "mutation-theme-1",
       "commandType": "app.setThemePreference",
       "scope": "host",
+      "authorityId": "app",
       "state": "committed",
       "workspaceId": null,
       "sessionId": null,
@@ -37,6 +39,8 @@
     }
   ],
   "expect": {
+    "receiptScope": "host",
+    "authorityId": "app",
     "runEnvelopeCount": 0,
     "terminalState": "committed"
   }

@@ -13,11 +13,29 @@
       "runSeq": 1,
       "payload": {
         "productTurnId": "turn-1",
-        "stepId": "step-1",
-        "blockId": "block-tool-1",
-        "sourceIndex": 0,
-        "toolCallId": "tool-call-1",
-        "name": "read"
+        "block": {
+          "kind": "tool",
+          "blockId": "block-tool-1",
+          "stepId": "step-1",
+          "sourceIndex": 0,
+          "status": "streaming",
+          "tool": {
+            "toolCallId": "tool-call-1",
+            "name": "read",
+            "toolKind": "read",
+            "declarationStatus": "preparing",
+            "argumentsPreview": "",
+            "argumentsTruncated": false,
+            "arguments": null,
+            "argumentsContent": null,
+            "executionStatus": "pending",
+            "summary": "read",
+            "details": null,
+            "startedAt": "2026-08-19T03:01:10.000Z",
+            "terminalAt": null,
+            "error": null
+          }
+        }
       }
     },
     {
@@ -68,20 +86,85 @@
       "runSeq": 4,
       "payload": {
         "productTurnId": "turn-1",
-        "stepId": "step-1",
-        "blockId": "block-tool-1",
-        "toolCallId": "tool-call-1",
-        "parsedArguments": {
-          "path": "README.md"
-        },
-        "error": null
+        "block": {
+          "kind": "tool",
+          "blockId": "block-tool-1",
+          "stepId": "step-1",
+          "sourceIndex": 0,
+          "status": "streaming",
+          "tool": {
+            "toolCallId": "tool-call-1",
+            "name": "read",
+            "toolKind": "read",
+            "declarationStatus": "ready",
+            "argumentsPreview": "{\"path\":\"README.md\"}",
+            "argumentsTruncated": false,
+            "arguments": {
+              "path": "README.md"
+            },
+            "argumentsContent": null,
+            "executionStatus": "pending",
+            "summary": "read",
+            "details": null,
+            "startedAt": "2026-08-19T03:01:10.000Z",
+            "terminalAt": null,
+            "error": null
+          }
+        }
       }
     }
   ],
   "expect": {
     "targetBlockId": "block-tool-1",
     "toolCallId": "tool-call-1",
-    "declarationStatus": "ready",
+    "initialToolBlock": {
+      "kind": "tool",
+      "blockId": "block-tool-1",
+      "stepId": "step-1",
+      "sourceIndex": 0,
+      "status": "streaming",
+      "tool": {
+        "toolCallId": "tool-call-1",
+        "name": "read",
+        "toolKind": "read",
+        "declarationStatus": "preparing",
+        "argumentsPreview": "",
+        "argumentsTruncated": false,
+        "arguments": null,
+        "argumentsContent": null,
+        "executionStatus": "pending",
+        "summary": "read",
+        "details": null,
+        "startedAt": "2026-08-19T03:01:10.000Z",
+        "terminalAt": null,
+        "error": null
+      }
+    },
+    "finalToolBlock": {
+      "kind": "tool",
+      "blockId": "block-tool-1",
+      "stepId": "step-1",
+      "sourceIndex": 0,
+      "status": "streaming",
+      "tool": {
+        "toolCallId": "tool-call-1",
+        "name": "read",
+        "toolKind": "read",
+        "declarationStatus": "ready",
+        "argumentsPreview": "{\"path\":\"README.md\"}",
+        "argumentsTruncated": false,
+        "arguments": {
+          "path": "README.md"
+        },
+        "argumentsContent": null,
+        "executionStatus": "pending",
+        "summary": "read",
+        "details": null,
+        "startedAt": "2026-08-19T03:01:10.000Z",
+        "terminalAt": null,
+        "error": null
+      }
+    },
     "executionMaySettleOutOfOrder": true
   }
 }

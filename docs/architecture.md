@@ -160,10 +160,10 @@ Theme preference is Host-owned application state. Bootstrap always returns `syst
 
 The SDK does not provide an atomic transaction between a yaca command record and `prompt()`. yaca therefore promises durable at-most-once invocation, not exactly-once execution.
 
-Every state-changing command records a scope: Host, Workspace, Session, or Run. Local mutations and runtime controls other than Prompt use `recorded → committed | failed | delivery_unknown`; `delivery_unknown` means durable intent exists but commit cannot be proven. Only `run.prompt` uses acceptance and creates a Run envelope:
+Every state-changing command records exactly one scope and canonical authority id: Host (`app`, `workspace-catalog`, or `selection`), Workspace id, Session id, or Run id. The exhaustive per-command mapping is part of the application protocol rather than inferred by handlers. Local mutations and runtime controls other than Prompt use `recorded → committed | failed | delivery_unknown`; `delivery_unknown` means durable intent exists but commit cannot be proven. Only `run.prompt` uses acceptance and creates a Run envelope:
 
 1. The Host validates authentication, schema, phase, and expected Session Version.
-2. It appends a `recorded` Command Receipt and reaches a durability boundary.
+2. It resolves the canonical receipt authority; for Prompt it also allocates the stable Run and Product Turn ids. It then appends a `recorded` Command Receipt and reaches a durability boundary.
 3. It invokes the Pi adapter.
 4. When public preflight behavior confirms Prompt acceptance, it appends one durable journal record containing the `accepted` Run-scoped receipt and a minimum Run envelope.
 5. On a proven Prompt terminal outcome, it appends one durable journal record containing the terminal receipt and terminal Run envelope before publishing the terminal event. Other mutations append a scope-aware committed or failed receipt without creating a Run envelope.
@@ -179,7 +179,7 @@ A duplicate mutation identifier returns its existing receipt and never invokes t
 5. Session JSONL is then reopened to rebuild committed content from the Run envelope's base identity.
 6. A new runtime projection epoch is created, and every old-epoch Active Overlay event is discarded.
 
-Neither Unknown Delivery nor Outcome Unknown is automatically replayed. Risk blocks mutations at receipt scope: Host, Workspace and descendants, Session and Runs, or the affected Run's Session side effects. After full application sync and explicit acknowledgement of that receipt, new in-scope mutation is allowed under current phase/version rules with a new mutation identifier. Reads and acknowledgement remain available; acknowledgement discovers scope from the receipt and never requires a Session payload.
+Neither Unknown Delivery nor Outcome Unknown is automatically replayed. Risk blocks mutations at receipt scope: Host, Workspace and descendants, Session and Runs, or the affected Run's Session side effects. After full application sync and explicit acknowledgement of that receipt, new in-scope mutation is allowed under current phase/version rules with a new mutation identifier. Reads and acknowledgement remain available; acknowledgement discovers target scope from the receipt and never requires a Session payload. The acknowledgement command itself is a Host `app` mutation; it does not relabel the target receipt's authority.
 
 Recovery behavior:
 
@@ -205,6 +205,8 @@ Every runtime projection has an opaque `runtimeEpoch`. Host restart, active runt
 
 Each connection buffer is bounded by both event count and serialized bytes. Overflow fails the in-progress sync with `sync_buffer_overflow`, discards the buffer, and requires a fresh `app.sync`; it never emits a partial snapshot. `session.sync` is only a navigation/explicit-inspection read and never returns or advances the global watermark. A disconnected connection discards its buffer. Contract tests inject events before, during, and after the barrier and prove no transition is lost or applied twice.
 
+Session and trash catalogs use revision-bound opaque cursors. A first page has no cursor or revision and returns both the captured catalog revision and the next cursor. Every continuation presents that exact pair, and the Host echoes the revision. A concurrent catalog mutation yields `stale_catalog_revision`; Web discards all cached pages for that catalog and starts at the first page. Cursors bind catalog kind, Workspace filter, sort, limit, and revision. Catalog-changing events carry the new revision. `session.sync` is not a catalog operation and never changes a catalog revision.
+
 ## Projection model
 
 The Session projector creates this product hierarchy:
@@ -222,7 +224,7 @@ Workspace
         └── Terminal state
 ```
 
-One Pi model-response/tool-loop unit maps to an Assistant Step, not a Product Turn. Blocks preserve source order. Tool declaration has dedicated start(name), arguments-fragment delta, and parsed-arguments/error settlement events; a preparing Tool Block does not require complete presenter details. Declaration and execution join by the SDK's `toolCallId`, so parallel completion order never reorders declared source positions. Stable keys survive final replacement so disclosure state, Inspector selection, and scroll anchors remain intact.
+One Pi model-response/tool-loop unit maps to an Assistant Step, not a Product Turn. Blocks preserve source order. Tool declaration has dedicated start, argument-fragment delta, and parsed-arguments/error settlement events. Start carries the complete deterministic preparing Tool Block; tool kind is derived only from exact built-in names, while summary, empty argument preview, timestamps, null details/error, and pending execution all have closed initial values. Deltas serially target the same block and `toolCallId`; unmatched deltas force reconciliation rather than creating a block. The argument preview stops at 64 KiB of complete UTF-8 scalars and marks truncation. Settlement carries the complete ready/invalid Tool Block and puts larger safe input in Content Store. Declaration and execution join by the SDK's `toolCallId`, so parallel completion order never reorders declared source positions. Stable keys survive final replacement so disclosure state, Inspector selection, and scroll anchors remain intact.
 
 The active view contains two layers:
 
@@ -293,16 +295,17 @@ The module interface is the test surface.
 
 - Shared schema fixtures are accepted identically by Host and Web.
 - Tests cover version negotiation, strict validation, correlation, frame limits, unknown messages, Origin rejection, sequence gaps, and reconnect.
-- Bootstrap/app-sync tests place events on both sides of the global sequence barrier, assert the atomic `snapshotSeq`, exercise buffering and overflow, discard duplicates, and reject stale runtime epochs. Session-sync tests prove it cannot advance the global watermark.
+- Bootstrap/app-sync tests place events on both sides of the global sequence barrier, assert the atomic `snapshotSeq`, exercise buffering and overflow, discard duplicates, and reject stale runtime epochs. Session-sync tests prove it cannot advance the global watermark or alter a catalog revision.
+- Catalog conformance covers first/continuation pairs, revision echo, cursor scope binding, concurrent invalidation, stale-page discard/restart, and new revisions on Session/trash events.
 
 ### Projection
 
-- Golden event traces cover Product Turn/Assistant Step grouping, stable keys, final replacement, tool declaration fragments, `toolCallId` execution identity, interrupted display reasons, errors, and unknown fallbacks.
+- Golden event traces cover Product Turn/Assistant Step grouping, stable keys, final replacement, complete initial/final Tool Blocks, serial and oversized declaration fragments, rejected unmatched targets, `toolCallId` execution identity, interrupted display reasons, errors, and unknown fallbacks.
 - Tests assert observable projections rather than projector internals.
 
 ### Command Ledger
 
-- Duplicate identifiers, receipt scope, local committed/failed paths, Prompt-only Run envelope linkage, delivery/outcome unknown separation, scope-aware acknowledgement, restart priority, truncated tails, and explicit new mutation receive deterministic tests.
+- Duplicate identifiers, exhaustive mutation-to-authority mapping, local committed/failed paths, pre-record Prompt identity allocation, Prompt-only Run envelope linkage, delivery/outcome unknown separation, scope-aware acknowledgement, restart priority, truncated tails, and explicit new mutation receive deterministic tests.
 - A fault-injection test kills the Host at each durability boundary and proves it never automatically invokes the same mutation twice.
 
 ### Recovery and browser paths

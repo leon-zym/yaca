@@ -19,6 +19,7 @@ Limits are measured after UTF-8 JSON serialization unless stated otherwise.
 | Prompt text | 262,144 bytes |
 | One realtime delta string | 32,768 bytes |
 | One preview string | 65,536 bytes |
+| Tool argument preview | 65,536 bytes |
 | One stored Content object | 268,435,456 bytes |
 | Sync event buffer | 4,096 events and 8,388,608 bytes |
 | Workspace registrations returned | 1,000 |
@@ -80,7 +81,7 @@ InterruptionReason = host_restart | runtime_replaced | runtime_lost
 WorkspaceChange = registered | updated | selected | removed
 SessionChange = created | renamed | committed | trashed | restored
 
-RetryDisposition = never | after_sync | explicit
+RetryDisposition = never | after_sync | restart_catalog | explicit
 ```
 
 Thinking choices are model-specific. A `ThinkingLevel` enum member is selectable only when present in that model's `supportedThinkingLevels`. The validated DeepSeek catalog entry contains exactly `off`, `low`, `high`, and `max`. Runtime clamp behavior MUST NOT add a catalog choice.
@@ -197,6 +198,7 @@ CommandReceipt = {
   clientMutationId: MutationId,
   commandType: MutationCommandType,
   scope: ReceiptScope,
+  authorityId: OpaqueId,
   state: ReceiptState,
   workspaceId: OpaqueId | null,
   sessionId: OpaqueId | null,
@@ -231,7 +233,7 @@ RunEnvelope = {
 
 Invariants:
 
-- Scope `host` requires all authority ids null. Scope `workspace` requires only `workspaceId`. Scope `session` requires `workspaceId` and `sessionId`. Scope `run` requires `workspaceId`, `sessionId`, and `runId`; `productTurnId` is required only for the `run.prompt` receipt.
+- `authorityId` is the one canonical id used for mutation blocking and ledger lookup. Scope `host` requires the fixed Host authority listed in section 6; its Workspace, Session, and Run lineage fields are null. Scope `workspace` uses `workspaceId` as `authorityId` and requires only the Workspace lineage. Scope `session` uses `sessionId` as `authorityId` and requires Workspace and Session lineage. Scope `run` uses `runId` as `authorityId` and requires Workspace, Session, and Run lineage; `productTurnId` is required only for the `run.prompt` receipt.
 - Every mutation other than `run.prompt` follows `recorded → committed | failed | delivery_unknown`. Its `delivery_unknown` means durable intent exists but the local or runtime-control commit cannot be proven.
 - A recorded `run.prompt` allocates Run and Product Turn ids so its receipt is Run-scoped. Only durable Prompt acceptance creates and requires the Run envelope; a Prompt that becomes `delivery_unknown` retains allocated ids with `acceptedAt: null` and has no Run envelope.
 - `outcome_unknown` means durable acceptance exists but no durable terminal outcome exists; receipt and Run envelope identities are complete.
@@ -351,7 +353,9 @@ ToolCallView = {
   toolKind: ToolKind,
   declarationStatus: ToolDeclarationStatus,
   argumentsPreview: string{0..65536 bytes},
+  argumentsTruncated: boolean,
   arguments: JsonValue | null,
+  argumentsContent: ContentReference | null,
   executionStatus: ToolExecutionStatus,
   summary: string{0..1000},
   details: ToolDetails | null,
@@ -405,7 +409,7 @@ ProductTurnView = {
 }
 ```
 
-During declaration, a Tool Call may have `arguments: null` and `details: null`; complete Tool Details are required only when the applicable execution projection is available. Tools are joined only by `toolCallId`. Parallel `tool.execution_settled` arrival order MUST NOT change `sourceIndex` or block order.
+During declaration, a Tool Call may have `arguments: null` and `details: null`; complete Tool Details are required only when the applicable execution projection is available. `argumentsContent` is an opaque Host Content Reference for complete safe arguments when the Web preview is truncated; it is never an SDK temporary path. Tools are joined only by `toolCallId`. Parallel `tool.execution_settled` arrival order MUST NOT change `sourceIndex` or block order.
 
 ### Snapshots
 
@@ -439,16 +443,28 @@ DegradedView = {
   since: IsoInstant
 }
 
+SessionCatalogPage = {
+  workspaceId: OpaqueId,
+  catalogRevision: OpaqueId,
+  sessions: SessionSummary[0..200],
+  nextCursor: Cursor | null
+}
+
+TrashCatalogPage = {
+  workspaceId: OpaqueId | null,
+  catalogRevision: OpaqueId,
+  entries: TrashRecord[0..200],
+  nextCursor: Cursor | null
+}
+
 BootstrapResult = {
   snapshotSeq: Sequence,
-  directoryRevision: OpaqueId,
-  trashRevision: OpaqueId,
+  workspaceCatalogRevision: OpaqueId,
   theme: ThemeSetting,
   workspaces: WorkspaceSummary[0..1000],
   selectedWorkspaceId: OpaqueId | null,
-  sessions: SessionSummary[0..200],
-  trash: TrashRecord[0..200],
-  trashCursor: Cursor | null,
+  selectedSessionCatalog: SessionCatalogPage | null,
+  trashCatalog: TrashCatalogPage,
   activeSessionId: OpaqueId | null,
   activeSync: SessionSyncView | null,
   modelCatalog: ModelCatalog,
@@ -464,7 +480,7 @@ SessionSyncResult = {
 AppSyncResult = BootstrapResult
 ```
 
-Only `BootstrapResult`/`AppSyncResult.snapshotSeq` is an atomic connection-global watermark, defined in section 10. `SessionSyncResult` is a navigation read and never advances the event sequence baseline.
+`selectedSessionCatalog` is null exactly when `selectedWorkspaceId` is null; otherwise its `workspaceId` equals `selectedWorkspaceId`. `trashCatalog.workspaceId` is null because bootstrap and app sync return the first global trash page. Only `BootstrapResult`/`AppSyncResult.snapshotSeq` is an atomic connection-global watermark, defined in section 10. `SessionSyncResult` is a navigation read and never advances the event sequence baseline.
 
 ## 5. Handshake and envelopes
 
@@ -541,6 +557,42 @@ Read commands require `clientMutationId: null`. Mutation commands require a non-
 
 `{}` means an exact empty object. Result arrays are bounded by section 2 and their shared schemas.
 
+Catalog pagination requests are closed unions:
+
+```text
+FirstSessionCatalogPageRequest = {
+  workspaceId: OpaqueId,
+  limit: integer{1..200}
+}
+
+ContinueSessionCatalogPageRequest = {
+  workspaceId: OpaqueId,
+  limit: integer{1..200},
+  catalogRevision: OpaqueId,
+  cursor: Cursor
+}
+
+SessionCatalogPageRequest = FirstSessionCatalogPageRequest |
+                            ContinueSessionCatalogPageRequest
+
+FirstTrashCatalogPageRequest = {
+  workspaceId: OpaqueId | null,
+  limit: integer{1..200}
+}
+
+ContinueTrashCatalogPageRequest = {
+  workspaceId: OpaqueId | null,
+  limit: integer{1..200},
+  catalogRevision: OpaqueId,
+  cursor: Cursor
+}
+
+TrashCatalogPageRequest = FirstTrashCatalogPageRequest |
+                          ContinueTrashCatalogPageRequest
+```
+
+A first page omits both `catalogRevision` and `cursor`; a continuation includes both. Supplying only one is schema-invalid.
+
 | Command type | Kind | Envelope scope | Exact payload | Exact success result |
 |---|---|---|---|---|
 | `app.bootstrap` | read | no Session/version | `{}` | `BootstrapResult` |
@@ -548,16 +600,16 @@ Read commands require `clientMutationId: null`. Mutation commands require a non-
 | `app.setThemePreference` | mutation | no Session/version | `{ themePreference: ThemePreference }` | `{ receipt: CommandReceipt, theme: ThemeSetting }` |
 | `workspace.list` | read | no Session/version | `{}` | `{ workspaces: WorkspaceSummary[] }` |
 | `workspace.register` | mutation | no Session/version | `{ path: LocalPathInput, displayName?: DisplayName }` | `{ receipt: CommandReceipt, workspace: WorkspaceSummary }` |
-| `workspace.select` | mutation | no Session/version | `{ workspaceId: OpaqueId }` | `{ receipt: CommandReceipt, workspace: WorkspaceSummary, sessions: SessionSummary[] }` |
+| `workspace.select` | mutation | no Session/version | `{ workspaceId: OpaqueId }` | `{ receipt: CommandReceipt, workspace: WorkspaceSummary, sessionCatalog: SessionCatalogPage }` |
 | `workspace.updateDisplayName` | mutation | no Session/version | `{ workspaceId: OpaqueId, displayName: DisplayName }` | `{ receipt: CommandReceipt, workspace: WorkspaceSummary }` |
 | `workspace.remove` | mutation | no Session/version | `{ workspaceId: OpaqueId }` | `{ receipt: CommandReceipt, workspaceId: OpaqueId }` |
-| `session.list` | read | no Session/version | `{ workspaceId: OpaqueId, cursor: Cursor \| null, limit: integer{1..200} }` | `{ sessions: SessionSummary[], nextCursor: Cursor \| null }` |
+| `session.list` | read | no Session/version | `SessionCatalogPageRequest` | `SessionCatalogPage` |
 | `session.create` | mutation | no Session/version | `{ workspaceId: OpaqueId, title?: SessionTitle }` | `{ receipt: CommandReceipt, session: SessionSummary, activated: boolean, view: SessionSyncResult }` |
 | `session.activate` | mutation | Session/version required | `{}` | `{ receipt: CommandReceipt, session: SessionSummary, view: SessionSyncResult }` |
 | `session.inspect` | read | Session required, version null | `{ turnLimit: integer{1..100} }` | `{ snapshot: CommittedSnapshot }` |
 | `session.rename` | mutation | Session/version required | `{ title: SessionTitle }` | `{ receipt: CommandReceipt, session: SessionSummary }` |
 | `session.trash` | mutation | Session/version required | `{}` | `{ receipt: CommandReceipt, trash: TrashRecord, activeSessionId: OpaqueId \| null, runtimeEpoch: RuntimeEpoch }` |
-| `session.trash.list` | read | no Session/version | `{ workspaceId: OpaqueId \| null, cursor: Cursor \| null, limit: integer{1..200} }` | `{ entries: TrashRecord[], nextCursor: Cursor \| null }` |
+| `session.trash.list` | read | no Session/version | `TrashCatalogPageRequest` | `TrashCatalogPage` |
 | `session.trash.restore` | mutation | no Session/version | `{ trashId: OpaqueId }` | `{ receipt: CommandReceipt, session: SessionSummary }` |
 | `session.sync` | read | Session required, version null | `{ knownRuntimeEpoch: RuntimeEpoch \| null, knownSessionVersion: SessionVersion \| null }` | `SessionSyncResult` |
 | `session.history` | read | Session required, version null | `{ cursor: Cursor, limit: integer{1..100} }` | `{ turns: ProductTurnView[], nextCursor: Cursor \| null, sessionVersion: SessionVersion }` |
@@ -570,9 +622,32 @@ Read commands require `clientMutationId: null`. Mutation commands require a non-
 
 `MutationCommandType` is exactly the mutation rows above. `CommandType` is exactly all rows above. Each mutation success returns its scope-aware committed or accepted receipt; an error response remains correlatable through `command.status`.
 
+Every mutation has exactly one receipt authority mapping:
+
+| Mutation command | Receipt scope | `authorityId` | Required lineage |
+|---|---|---|---|
+| `app.setThemePreference` | `host` | `app` | all lineage ids null |
+| `workspace.register` | `host` | `workspace-catalog` | all lineage ids null |
+| `workspace.select` | `host` | `selection` | all lineage ids null |
+| `workspace.updateDisplayName` | `workspace` | payload `workspaceId` | that `workspaceId`; Session/Run ids null |
+| `workspace.remove` | `workspace` | payload `workspaceId` | that `workspaceId`; Session/Run ids null |
+| `session.create` | `workspace` | payload `workspaceId` | that `workspaceId`; Session/Run ids null |
+| `session.activate` | `session` | envelope `sessionId` | resolved Workspace and envelope Session; Run id null |
+| `session.rename` | `session` | envelope `sessionId` | resolved Workspace and envelope Session; Run id null |
+| `session.trash` | `session` | envelope `sessionId` | resolved Workspace and envelope Session; Run id null |
+| `session.trash.restore` | `workspace` | trash record `workspaceId` | resolved Workspace; Session/Run ids null |
+| `run.prompt` | `run` | Host-allocated `runId` | resolved Workspace/Session plus allocated Run and Product Turn ids |
+| `run.abort` | `run` | payload `runId` | active Workspace/Session plus the exact payload Run id; Product Turn id null |
+| `command.acknowledgeUnknown` | `host` | `app` | all lineage ids null; target receipt scope remains unchanged |
+| `runtime.setDesiredModel` | `session` | envelope `sessionId` | resolved Workspace and envelope Session; Run id null |
+| `runtime.setDesiredThinking` | `session` | envelope `sessionId` | resolved Workspace and envelope Session; Run id null |
+
+This table is exhaustive for `MutationCommandType`; implementations MUST fail schema generation or conformance if a mutation is missing or maps to more than one row. For `run.prompt`, the Host allocates `runId` and `productTurnId` before appending the durable `recorded` intention. Those ids and the receipt are returned by success or recovered by `command.status(clientMutationId)`, so the same mutation identity never acquires a second Run id.
+
 Command invariants:
 
 - `app.bootstrap` and `app.sync` execute through the global atomic snapshot barrier. `session.sync` is a navigation/inspection read and MUST NOT pause global delivery, change `lastApplied`, or supply a `snapshotSeq`.
+- Every first Session/Trash catalog response returns its current opaque `catalogRevision` and `nextCursor`. A continuation cursor is valid only with the same revision, catalog kind, Workspace filter, sort, and limit encoded by that cursor. If the current catalog changed, the Host returns `stale_catalog_revision`; the client discards every page for that catalog and starts again without cursor or revision. A successful continuation echoes the requested revision. `session.sync` neither returns nor changes a catalog revision.
 - `app.setThemePreference` reaches atomic persistence before success and emits `app.theme_changed` to all connected clients.
 - `workspace.register` canonicalizes the path, then requires existence, directory type, read/search/write permission, and uniqueness by canonical identity.
 - `workspace.updateDisplayName` changes no filesystem path.
@@ -581,7 +656,7 @@ Command invariants:
 - `run.prompt` success means durable acceptance and a durable Run envelope exist. It is the only command whose accepted receipt creates or requires a Run envelope. Preflight rejection is an error response with a failed receipt retrievable by `command.status`.
 - `run.abort.payload.runId` is mandatory and MUST equal the active Run. Missing is schema-invalid; no active Run returns `run_not_active`; a different active identity returns `run_mismatch`. The Host never aborts by implicit current state.
 - Desired Settings never alter the current Run snapshot.
-- A receipt's unknown-risk blocker follows its scope: Host blocks every mutation; Workspace blocks that Workspace and descendants; Session blocks that Session and Runs; Run blocks new Run/Session side effects for its Session. `command.acknowledgeUnknown` discovers scope from the receipt and therefore requires no Session envelope fields; its own receipt copies the acknowledged receipt's scope and authority ids. Reads remain allowed.
+- A receipt's unknown-risk blocker follows its scope: Host blocks every mutation; Workspace blocks that Workspace and descendants; Session blocks that Session and Runs; Run blocks new Run/Session side effects for its Session. `command.acknowledgeUnknown` discovers the target scope from the referenced receipt and therefore requires no Session envelope fields; the acknowledgement mutation's own receipt is always Host-scoped at `app`, while the acknowledged receipt retains its original scope and authority. Reads remain allowed.
 - A post-acknowledgement Prompt requires idle, a fresh sync's Session Version/runtime epoch, and a new mutation identifier.
 
 ## 7. Event schemas
@@ -593,15 +668,15 @@ ThemeChangedPayload = { theme: ThemeSetting }
 
 WorkspaceChangedPayload = {
   change: WorkspaceChange,
-  directoryRevision: OpaqueId,
+  workspaceCatalogRevision: OpaqueId,
   workspaceId: OpaqueId,
   workspace: WorkspaceSummary | null
 }
 
 SessionDirectoryChangedPayload = {
   change: SessionChange,
-  directoryRevision: OpaqueId,
-  trashRevision: OpaqueId,
+  sessionCatalogRevision: OpaqueId,
+  trashCatalogRevision: OpaqueId,
   sessionId: OpaqueId,
   session: SessionSummary | null,
   trash: TrashRecord | null
@@ -611,7 +686,8 @@ ActiveSessionChangedPayload = {
   previousSessionId: OpaqueId | null,
   activeSessionId: OpaqueId | null,
   runtimeEpoch: RuntimeEpoch,
-  sessionVersion: SessionVersion | null
+  sessionVersion: SessionVersion | null,
+  sessionCatalogRevision: OpaqueId
 }
 
 DesiredSettingsChangedPayload = { desiredSettings: DesiredSettings }
@@ -647,11 +723,7 @@ BlockSettledPayload = {
 
 ToolDeclarationStartedPayload = {
   productTurnId: OpaqueId,
-  stepId: OpaqueId,
-  blockId: OpaqueId,
-  sourceIndex: integer{0..255},
-  toolCallId: OpaqueId,
-  name: string{1..256}
+  block: ToolBlock
 }
 
 ToolDeclarationDeltaPayload = {
@@ -664,11 +736,7 @@ ToolDeclarationDeltaPayload = {
 
 ToolDeclarationSettledPayload = {
   productTurnId: OpaqueId,
-  stepId: OpaqueId,
-  blockId: OpaqueId,
-  toolCallId: OpaqueId,
-  parsedArguments: JsonValue | null,
-  error: AppError | null
+  block: ToolBlock
 }
 
 ToolExecutionStartedPayload = {
@@ -699,6 +767,7 @@ RunStateChangedPayload = { run: RunEnvelope }
 
 SessionCommittedPayload = {
   sessionVersion: SessionVersion,
+  sessionCatalogRevision: OpaqueId,
   turns: ProductTurnView[0..4]
 }
 
@@ -707,7 +776,11 @@ CommandReceiptChangedPayload = { receipt: CommandReceipt }
 HostDegradedPayload = { degraded: DegradedView }
 ```
 
-`ToolDeclarationSettledPayload` requires exactly one of: non-null `parsedArguments`, or non-null `error`.
+The declaration-start block is a complete deterministic initial `ToolBlock`: `kind=tool`; payload `productTurnId` owns `stepId`; `sourceIndex` is its stable source position; `status=streaming`; `tool.toolCallId` and `tool.name` are the SDK declaration identities; `tool.toolKind` is `read`, `edit`, `write`, or `bash` only for that exact built-in name and otherwise `unknown`; `declarationStatus=preparing`; `argumentsPreview=""`; `argumentsTruncated=false`; `arguments=null`; `argumentsContent=null`; `executionStatus=pending`; `summary` equals `name`; `details=null`; `startedAt` is the Host-observed declaration event time; and `terminalAt` and `error` are null.
+
+The declaration-settled block repeats the same block, step, source, and Tool Call identities. Its `declarationStatus` is `ready` with non-null safe `arguments` and null `error`, or `invalid` with null `arguments` and non-null safe `error`; all other fields reflect the accumulated declaration. `argumentsContent` is non-null when complete safe arguments were retained outside the bounded preview. This xor is normative.
+
+`WorkspaceChangedPayload.workspace` is non-null for `registered`, `updated`, and `selected`, and null for `removed`.
 
 | Event type | Required envelope scope | Exact payload |
 |---|---|---|
@@ -732,7 +805,9 @@ HostDegradedPayload = { degraded: DegradedView }
 | `command.receipt_changed` | receipt-derived scope; runtime fields only for accepted Run | `CommandReceiptChangedPayload` |
 | `host.degraded` | affected scope or all null for Host-wide | `HostDegradedPayload` |
 
-Runtime events MUST carry the current `runtimeEpoch` and strictly increasing `runSeq`. Tool declaration start creates the preparing Tool Block at `sourceIndex`; deltas append only `argumentsFragment`; settlement provides either parsed arguments or a parse error and sets declaration status to `ready` or `invalid`. Generic `block.delta` MUST NOT carry tool arguments. Execution may settle out of order but always joins declaration state by `toolCallId`.
+Runtime events MUST carry the current `runtimeEpoch` and strictly increasing `runSeq`. A Tool declaration delta applies only when both `blockId` and `toolCallId` identify the same existing preparing block; deltas for each block append serially in `runSeq` order. The client appends UTF-8 bytes to `argumentsPreview` until the cumulative 65,536-byte limit, then stops appending and sets `argumentsTruncated=true`; it never appends part of a Unicode scalar. A missing target, either mismatched identity, or a delta after settlement is a protocol violation: the event is not applied and the client requires full `app.sync`. Generic `block.delta` MUST NOT carry tool arguments.
+
+At settlement the Host safely parses complete SDK arguments or supplies a safe `AppError`. Arguments exposed to Web remain bounded: structured `arguments` obeys `JsonValue` limits, `argumentsPreview` obeys the preview limit, and larger complete safe input uses `argumentsContent`. An execution event may use the adapter's complete SDK arguments to build presenter details but MUST NOT copy them unbounded into the Web projection. Execution may settle out of order but always joins declaration state by `toolCallId`.
 
 A client encountering a global `connectionSeq` gap, runtime-epoch mismatch, or sync-buffer overflow requests `app.sync`. It MUST NOT repair global state with `session.sync`.
 
@@ -785,6 +860,7 @@ workspace_path_unwritable | workspace_duplicate |
 workspace_display_name_invalid | workspace_in_use |
 
 session_not_found | session_busy | stale_session_version |
+stale_catalog_revision |
 trash_not_found | session_restore_conflict | session_restore_workspace_missing |
 
 run_not_active | run_mismatch | receipt_not_found |
@@ -803,6 +879,7 @@ Stable retry dispositions:
 |---|---|
 | schema, protocol, auth, invalid path/name | `never` |
 | stale version, gap, epoch mismatch | `after_sync` |
+| stale Session/Trash catalog continuation | `restart_catalog` |
 | busy, restore conflict, model/provider, unknown delivery/outcome | `explicit` |
 | storage failure, SDK incompatibility | `never` until Host state changes |
 
@@ -812,6 +889,7 @@ Specific invariants:
 - Permission checks return `workspace_path_unreadable` or `workspace_path_unwritable`, not generic storage errors.
 - Abort identity mismatch returns `run_mismatch` with safe `activeRunId` detail.
 - Unknown receipt state blocks mutation with `unresolved_command_outcome` and the blocking `receiptId`.
+- A valid continuation cursor whose bound revision is no longer current returns `stale_catalog_revision`; the response exposes no replacement cursor or page.
 - `command_delivery_unknown` describes unproven local commit or Prompt acceptance; `command_outcome_unknown` describes proven Prompt acceptance with unproven terminal result.
 
 ## 10. Atomic sync watermark
@@ -827,9 +905,9 @@ Specific invariants:
 7. The Host releases buffered events in ascending `connectionSeq` order.
 8. The client discards `connectionSeq <= lastApplied`, accepts exactly `lastApplied + 1`, and requests another `app.sync` on a gap or runtime-epoch mismatch.
 
-The application snapshot includes the complete Workspace registry, authoritative `directoryRevision`/`trashRevision`, bounded selected Session/trash pages with cursors, Active Session/runtime state, theme, model/Desired Settings, and recent scoped receipts. Installing it invalidates cached directory pages whose revision differs; the client refetches those pages without advancing the watermark. The snapshot and watermark are one logical read; neither may be captured without the other. Buffer overflow returns `sync_buffer_overflow`, sends no partial snapshot, discards the buffer, and requires a fresh `app.sync`. Socket loss discards the connection buffer. This protocol provides lossless reconciliation without claiming durable event replay.
+The application snapshot includes the complete Workspace registry and its revision, authoritative first `selectedSessionCatalog` and global `trashCatalog` pages with opaque revisions/cursors, Active Session/runtime state, theme, model/Desired Settings, and recent scoped receipts. Installing it invalidates cached Session/Trash catalog pages whose revision differs; the client refetches those catalogs from their first page without advancing the watermark. The snapshot and watermark are one logical read; neither may be captured without the other. Buffer overflow returns `sync_buffer_overflow`, sends no partial snapshot, discards the buffer, and requires a fresh `app.sync`. Socket loss discards the connection buffer. This protocol provides lossless reconciliation without claiming durable event replay.
 
-`session.sync` returns one navigation view at its observed Session Version. It does not pause events, include `snapshotSeq`, modify `lastApplied`, or recover a gap. Events arriving around it are reconciled only by their normal global sequence or a later `app.sync`.
+`session.sync` returns one navigation view at its observed Session Version. It does not pause events, include `snapshotSeq` or a catalog revision, modify `lastApplied`, recover a gap, or increment any catalog revision. Events arriving around it are reconciled only by their normal global sequence or a later `app.sync`.
 
 ## 11. Content HTTP schema
 
@@ -891,12 +969,13 @@ Host and Web independently generate fixtures from the schemas above. The shared 
 - Workspace missing, file-not-directory, unreadable, unwritable, symlink duplicate, display-name update, and remove-without-delete fixtures;
 - trash/list/restore, missing manual trash, restore conflict, and indefinite-retention fixtures;
 - exact-run abort success, missing `runId`, no active Run, and mismatched Run fixtures;
-- Host/Workspace/Session/Run-scoped non-Prompt receipts for `recorded → committed | failed | delivery_unknown`;
+- one generated fixture row for every mutation in the exhaustive authority table, asserting its sole `ReceiptScope`, exact `authorityId`, required/null lineage, and no duplicate or missing mapping; Host/Workspace/Session/Run-scoped non-Prompt receipts cover `recorded → committed | failed | delivery_unknown`;
 - Prompt receipt paths for terminal success/failure/abort, `delivery_unknown`, `outcome_unknown`, scope-aware risk acknowledgement, and post-acknowledgement new mutation;
 - minimum Run envelope linkage across receipt, Product Turn, Session, Run, base version, settings, and runtime epoch;
+- first and continuation Session/Trash catalog pages, same-revision echo, cursor filter binding, concurrent revision change returning `stale_catalog_revision`, client page discard/restart, revision-bearing catalog events, and proof that `session.sync` neither returns nor changes a catalog revision;
 - full `app.sync` snapshots with events immediately before, during, and after the barrier, duplicate events, gaps, epoch mismatch, buffer overflow, and reconnect; `session.sync` fixtures prove it never advances the global watermark;
 - a DeepSeek catalog fixture with exactly `off`, `low`, `high`, and `max`, plus rejection of unsupported levels;
-- Tool declaration start/argument fragments/parsed settlement and parallel Tool Calls whose execution completion order differs from declaration order but remains joined by `toolCallId`;
+- Tool declaration start with every deterministic initial `ToolBlock` field, serial argument fragments, exact 65,536-byte UTF-8 truncation, missing/mismatched-target rejection, complete settled block with safe parsed arguments or error, Content Reference fallback, and parallel Tool Calls whose execution completion order differs from declaration order but remains joined by `toolCallId`;
 - active-session trash rejection while running, idle fallback selection, event order, successful restore, compensation, and degraded rollback failure;
 - Read direct Content Store capture, Bash temporary-path ingestion, large edit diff reference, Content range, and oversized-content failure; and
 - strict rejection of oversized frames, unknown fields, unsafe Origin, forged Session Version, and unauthorized Content Reference.
