@@ -1,0 +1,10 @@
+node_modules
+dist
+coverage
+pnpm-lock.yaml
+.agents
+skills-lock.json
+AGENTS.md
+CONTEXT.md
+DESIGN.md
+docs

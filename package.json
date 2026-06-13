@@ -1,0 +1,48 @@
+{
+  "name": "yaca",
+  "version": "0.1.0",
+  "description": "A local, browser-based AI coding agent workbench",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "yaca": "./bin/yaca.js"
+  },
+  "files": [
+    "apps/host/dist",
+    "apps/web/dist",
+    "bin",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "pnpm@11.22.0+sha512.1ff870c4c6133dfd88fb2afc46dd13d47f09c9794b438c6fdb47ca98caf3bc16381ee0be93a091b8e3824cf01f889f46d7d9e20910fb0be1ab0fb5baa80dd621",
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "check": "pnpm format && pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "dev": "pnpm --filter @yaca/contracts build && pnpm --filter @yaca/web build && pnpm --filter @yaca/host dev",
+    "dev:web": "pnpm --filter @yaca/web dev",
+    "format": "prettier --check .",
+    "format:write": "prettier --write .",
+    "lint": "eslint .",
+    "test": "pnpm -r --if-present test",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "yaca": "node ./bin/yaca.js"
+  },
+  "dependencies": {
+    "@fastify/static": "10.1.3",
+    "fastify": "5.12.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.1",
+    "eslint": "9.39.1",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-react-refresh": "0.5.4",
+    "globals": "16.4.0",
+    "prettier": "3.8.1",
+    "prettier-plugin-tailwindcss": "0.8.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.67.0"
+  }
+}
