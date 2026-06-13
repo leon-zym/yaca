@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, realpath, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, realpath, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { prepareYacaPaths } from "@yaca/host";
@@ -42,7 +42,17 @@ describe("yaca persistence paths", () => {
     expect(Object.values(paths).every((path) => !path.includes(".pi"))).toBe(true);
   });
 
-  test("normalizes an injected root symlink before deriving children", async () => {
+  test("creates a missing yaca data root with owner-only permissions", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "yaca-root-mode-"));
+    temporaryRoots.push(parent);
+    const requestedRoot = join(parent, "data");
+
+    const paths = await prepareYacaPaths({ root: requestedRoot });
+
+    expect((await stat(paths.root)).mode & 0o777).toBe(0o700);
+  });
+
+  test("rejects a yaca data root whose leaf is a symbolic link", async () => {
     const parent = await mkdtemp(join(tmpdir(), "yaca-root-link-"));
     temporaryRoots.push(parent);
     const target = join(parent, "canonical");
@@ -50,14 +60,10 @@ describe("yaca persistence paths", () => {
     await mkdir(target);
     await symlink(target, linkedRoot, "dir");
 
-    const paths = await prepareYacaPaths({ root: linkedRoot });
-
-    expect(paths.root).toBe(await realpath(target));
-    expect(
-      Object.values(paths).every(
-        (path) => path === paths.root || path.startsWith(`${paths.root}/`),
-      ),
-    ).toBe(true);
+    await expect(prepareYacaPaths({ root: linkedRoot })).rejects.toThrow(
+      "yaca data root must not be a symbolic link",
+    );
+    expect(await readdir(target)).toEqual([]);
   });
 
   test("rejects a derived directory symlink that escapes the canonical root", async () => {

@@ -1,5 +1,5 @@
 import { HealthResponseSchema, Value } from "@yaca/contracts";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -82,7 +82,12 @@ describe("Host network boundary", () => {
     const first = await startHost({ paths, port: 0 });
     runningHosts.push(first);
 
-    await expect(access(join(paths.run, "host.lock"))).resolves.toBeUndefined();
+    const lockPath = join(paths.run, "host.lock");
+    await expect(access(lockPath)).resolves.toBeUndefined();
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toMatchObject({
+      pid: process.pid,
+      instanceId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+    });
     await expect(startHost({ paths, port: 0 })).rejects.toThrow("another yaca Host is running");
 
     await first.close();
@@ -91,5 +96,67 @@ describe("Host network boundary", () => {
 
     const restarted = await startHost({ paths, port: 0 });
     runningHosts.push(restarted);
+  });
+
+  test("reclaims a valid Host lock whose owner process is dead", async () => {
+    const paths = await createPaths();
+    const lockPath = join(paths.run, "host.lock");
+    await writeFile(
+      lockPath,
+      `${JSON.stringify({
+        pid: 2_147_483_647,
+        instanceId: "00000000-0000-4000-8000-000000000000",
+        startedAt: "2026-01-01T00:00:00.000Z",
+      })}\n`,
+    );
+
+    const host = await startHost({ paths, port: 0 });
+    runningHosts.push(host);
+
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toMatchObject({
+      pid: process.pid,
+      instanceId: expect.not.stringMatching(/^0{8}-/u),
+    });
+  });
+
+  test("reclaims damaged and malicious Host lock records", async () => {
+    const paths = await createPaths();
+    const lockPath = join(paths.run, "host.lock");
+
+    for (const contents of [
+      "not-json\n",
+      `${JSON.stringify({
+        pid: process.pid,
+        instanceId: "../../not-an-instance",
+        startedAt: "not-a-date",
+      })}\n`,
+    ]) {
+      await writeFile(lockPath, contents);
+      const host = await startHost({ paths, port: 0 });
+      expect(JSON.parse(await readFile(lockPath, "utf8"))).toMatchObject({ pid: process.pid });
+      await host.close();
+    }
+  });
+
+  test("allows exactly one contender to replace a stale Host lock", async () => {
+    const paths = await createPaths();
+    await writeFile(join(paths.run, "host.lock"), "damaged\n");
+
+    const results = await Promise.allSettled(
+      Array.from({ length: 8 }, () => startHost({ paths, port: 0 })),
+    );
+    const started = results.filter(
+      (result): result is PromiseFulfilledResult<RunningHost> => result.status === "fulfilled",
+    );
+    const rejected = results.filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    runningHosts.push(...started.map((result) => result.value));
+
+    expect(started).toHaveLength(1);
+    expect(rejected).toHaveLength(7);
+    expect(
+      rejected.every((result) => String(result.reason).includes("another yaca Host is running")),
+    ).toBe(true);
   });
 });

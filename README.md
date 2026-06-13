@@ -45,14 +45,16 @@ Useful options:
 - `--port <port>` selects the local port; use `0` to ask the OS for an ephemeral port.
 - `--host <host>` exists for explicit configuration but accepts only `127.0.0.1`.
 
-The production CLI always uses `~/.yaca/`. It creates and canonicalizes that root before the Host
-starts, rejects derived paths that escape it, and holds `~/.yaca/run/host.lock` so a second Host
-cannot use the same data root. Tests inject temporary roots only through the Host package's module
-API. The foundation does not load `.env` files.
+The production CLI always uses `~/.yaca/`. If the root is missing, yaca creates it with owner-only
+permissions (`0700`) and canonicalizes it before the Host starts. It refuses a symbolic link at the
+data-root leaf and rejects derived paths that escape the canonical root. The Host records its PID
+and unique instance in `~/.yaca/run/host.lock`: a live owner blocks a second Host, while a dead or
+invalid stale lock is reclaimed after a crash. Tests inject temporary roots only through the Host
+package's module API. The foundation does not load `.env` files.
 
 `GET /api/health` is liveness status for the local shell. It is not application bootstrap or
-authority state. The authenticated application bootstrap belongs to the later WebSocket protocol
-slice.
+authority state. Authentication, origin enforcement, and the application protocol gateway belong
+to a later security slice and are not present in this foundation.
 
 ## Development
 
@@ -61,6 +63,9 @@ Build the Web shell once and start the TypeScript Host:
 ```sh
 pnpm dev
 ```
+
+Source development reports the explicit non-release version `0.0.0-dev`; production builds inject
+the release version from the root package manifest.
 
 For Web-only iteration, run `pnpm dev:web`; Vite binds to `127.0.0.1:5173` and proxies `/api` to a
 Host on `127.0.0.1:3210`.
@@ -86,9 +91,11 @@ pnpm check
 ```
 
 Tests use temporary filesystems and real loopback HTTP. They cover canonical runtime-root
-preparation, symlink escape rejection, single-Host locking, non-loopback rejection, the health
-schema, CLI help/version/start parameters, and Web static fallback. The pack smoke builds a
-tarball, installs it into a fresh temporary consumer, and starts the installed `yaca` binary.
+preparation, root-leaf and derived-path symlink rejection, owner-only root creation, live and stale
+Host locking (including SIGKILL recovery and concurrent contenders), non-loopback rejection, the
+health schema, production and development CLI startup, and Web static fallback. The pack smoke
+builds a tarball, installs it into a fresh temporary consumer, and starts the installed `yaca`
+binary.
 
 ## Security boundary
 

@@ -1,4 +1,4 @@
-import { mkdir, realpath } from "node:fs/promises";
+import { lstat, mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
@@ -33,9 +33,24 @@ async function prepareChild(root: string, name: string): Promise<string> {
   return canonicalPath;
 }
 
+async function ensureRootDirectory(requestedRoot: string): Promise<void> {
+  try {
+    if ((await lstat(requestedRoot)).isSymbolicLink()) {
+      throw new Error("yaca data root must not be a symbolic link");
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await mkdir(requestedRoot, { mode: 0o700, recursive: true });
+  }
+
+  if ((await lstat(requestedRoot)).isSymbolicLink()) {
+    throw new Error("yaca data root must not be a symbolic link");
+  }
+}
+
 export async function prepareYacaPaths(options: PrepareYacaPathsOptions = {}): Promise<YacaPaths> {
   const requestedRoot = resolve(options.root ?? join(options.home ?? homedir(), ".yaca"));
-  await mkdir(requestedRoot, { recursive: true });
+  await ensureRootDirectory(requestedRoot);
   const root = await realpath(requestedRoot);
 
   const [agent, app, content, trash, logs, run, temporary] = await Promise.all([

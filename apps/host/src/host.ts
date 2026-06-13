@@ -1,4 +1,5 @@
-import { open, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { link, open, readFile, rename, rm, unlink } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { join, posix } from "node:path";
 
@@ -25,28 +26,121 @@ export interface RunningHost {
   close(): Promise<void>;
 }
 
+interface HostLockRecord {
+  pid: number;
+  instanceId: string;
+  startedAt: string;
+}
+
+function parseHostLock(contents: string): HostLockRecord | undefined {
+  try {
+    const value = JSON.parse(contents) as Record<string, unknown>;
+    if (
+      !Number.isSafeInteger(value.pid) ||
+      (value.pid as number) <= 0 ||
+      typeof value.instanceId !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+        value.instanceId,
+      ) ||
+      typeof value.startedAt !== "string" ||
+      !Number.isFinite(Date.parse(value.startedAt))
+    ) {
+      return undefined;
+    }
+    return value as unknown as HostLockRecord;
+  } catch {
+    return undefined;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+async function restoreClaimedLock(claimedPath: string, lockPath: string): Promise<void> {
+  try {
+    await link(claimedPath, lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+}
+
 async function acquireHostLock(paths: YacaPaths): Promise<() => Promise<void>> {
   const lockPath = join(paths.run, "host.lock");
-  let handle;
+  const instanceId = randomUUID();
+  const candidatePath = join(paths.run, `host.lock.candidate-${instanceId}`);
+  const record: HostLockRecord = {
+    pid: process.pid,
+    instanceId,
+    startedAt: new Date().toISOString(),
+  };
+  const candidate = await open(candidatePath, "wx", 0o600);
   try {
-    handle = await open(lockPath, "wx", 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new Error("another yaca Host is running for this data root", { cause: error });
-    }
-    throw error;
+    await candidate.writeFile(`${JSON.stringify(record)}\n`);
+    await candidate.sync();
+  } finally {
+    await candidate.close();
   }
 
-  await handle.writeFile(
-    `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`,
-  );
+  try {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      try {
+        await link(candidatePath, lockPath);
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+
+      let observedContents: string;
+      try {
+        observedContents = await readFile(lockPath, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      const observedRecord = parseHostLock(observedContents);
+      if (observedRecord && isProcessAlive(observedRecord.pid)) {
+        throw new Error("another yaca Host is running for this data root");
+      }
+
+      const claimedPath = join(paths.run, `host.lock.stale-${randomUUID()}`);
+      try {
+        await rename(lockPath, claimedPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+
+      const claimedContents = await readFile(claimedPath, "utf8").catch(() => "");
+      if (claimedContents !== observedContents) {
+        await restoreClaimedLock(claimedPath, lockPath);
+      }
+      await rm(claimedPath, { force: true });
+    }
+
+    const installedRecord = await readFile(lockPath, "utf8").then(parseHostLock);
+    if (installedRecord?.instanceId !== instanceId) {
+      if (installedRecord && isProcessAlive(installedRecord.pid)) {
+        throw new Error("another yaca Host is running for this data root");
+      }
+      throw new Error("unable to acquire the yaca Host lock safely");
+    }
+  } finally {
+    await rm(candidatePath, { force: true });
+  }
+
   let released = false;
   return async () => {
     if (released) return;
     released = true;
-    await handle.close();
     try {
-      await unlink(lockPath);
+      const current = await readFile(lockPath, "utf8").then(parseHostLock);
+      if (current?.instanceId === instanceId) await unlink(lockPath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
