@@ -1,11 +1,11 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
 const hostRoot = resolve(import.meta.dirname, "..");
-const cliPath = join(hostRoot, "src", "cli.ts");
+const cliPath = join(hostRoot, "dist", "cli.js");
 const temporaryRoots: string[] = [];
 const children = new Set<ReturnType<typeof spawn>>();
 
@@ -21,7 +21,7 @@ function runCli(
   ...args: string[]
 ): Promise<{ code: number | null; stderr: string; stdout: string }> {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(process.execPath, ["--import", "tsx", cliPath, ...args], {
+    const child = spawn(process.execPath, [cliPath, ...args], {
       cwd: hostRoot,
       env: { ...process.env, NO_COLOR: "1" },
       stdio: ["ignore", "pipe", "pipe"],
@@ -46,37 +46,25 @@ describe("yaca CLI", () => {
 
     expect(help.code).toBe(0);
     expect(help.stdout).toContain("Usage: yaca [start] [options]");
-    expect(help.stdout).toContain("--data-dir <path>");
+    expect(help.stdout).not.toContain("--data-dir");
+    expect(help.stdout).not.toContain("--web-root");
     expect(version).toEqual({ code: 0, stderr: "", stdout: "0.1.0\n" });
   });
 
-  test("starts on an ephemeral loopback port with an injected data root", async () => {
+  test("starts on an ephemeral loopback port using .yaca below the process home", async () => {
     const temporary = await mkdtemp(join(tmpdir(), "yaca-cli-"));
     temporaryRoots.push(temporary);
-    const dataRoot = join(temporary, "data");
-    const webRoot = join(temporary, "web");
-    await mkdir(webRoot);
-    await writeFile(join(webRoot, "index.html"), "<!doctype html><title>CLI shell</title>");
+    const home = join(temporary, "home");
+    const ignoredYacaHome = join(temporary, "ignored-yaca-home");
+    const dataRoot = join(home, ".yaca");
+    await mkdir(home);
 
     const child = spawn(
       process.execPath,
-      [
-        "--import",
-        "tsx",
-        cliPath,
-        "start",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "0",
-        "--data-dir",
-        dataRoot,
-        "--web-root",
-        webRoot,
-      ],
+      [cliPath, "start", "--host", "127.0.0.1", "--port", "0"],
       {
         cwd: hostRoot,
-        env: { ...process.env, NO_COLOR: "1" },
+        env: { ...process.env, HOME: home, NO_COLOR: "1", YACA_HOME: ignoredYacaHome },
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
@@ -97,7 +85,7 @@ describe("yaca CLI", () => {
       child.on("exit", (code) => reject(new Error(`CLI exited early with ${String(code)}`)));
     });
 
-    expect(await fetch(url).then((response) => response.text())).toContain("CLI shell");
+    expect(await fetch(url).then((response) => response.text())).toContain("<title>yaca</title>");
     expect((await readdir(dataRoot)).sort()).toEqual([
       "agent",
       "app",
@@ -111,5 +99,7 @@ describe("yaca CLI", () => {
     child.kill("SIGTERM");
     await new Promise((resolveExit) => child.once("exit", resolveExit));
     children.delete(child);
+    await expect(readdir(join(dataRoot, "run"))).resolves.not.toContain("host.lock");
+    await expect(readdir(ignoredYacaHome)).rejects.toThrow();
   });
 });

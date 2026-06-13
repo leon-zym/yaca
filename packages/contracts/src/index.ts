@@ -14,24 +14,3 @@ export const HealthResponseSchema = Type.Object(
 );
 
 export type HealthResponse = Static<typeof HealthResponseSchema>;
-
-export const BootstrapResponseSchema = Type.Object(
-  {
-    application: Type.Literal("yaca"),
-    version: Type.String({ minLength: 1, maxLength: 128 }),
-    protocol: Type.Object(
-      {
-        major: Type.Literal(1),
-        minor: Type.Integer({ minimum: 0, maximum: 65_535 }),
-      },
-      { additionalProperties: false },
-    ),
-    capabilities: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
-      maxItems: 128,
-      uniqueItems: true,
-    }),
-  },
-  { additionalProperties: false },
-);
-
-export type BootstrapResponse = Static<typeof BootstrapResponseSchema>;

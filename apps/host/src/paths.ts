@@ -1,5 +1,6 @@
+import { mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 export interface YacaPaths {
   root: string;
@@ -12,22 +13,40 @@ export interface YacaPaths {
   temporary: string;
 }
 
-export interface ResolveYacaPathsOptions {
+export interface PrepareYacaPathsOptions {
   root?: string;
   home?: string;
 }
 
-export function resolveYacaPaths(options: ResolveYacaPathsOptions = {}): YacaPaths {
-  const root = resolve(options.root ?? join(options.home ?? homedir(), ".yaca"));
+function assertContained(root: string, candidate: string, name: string): void {
+  const relation = relative(root, candidate);
+  if (relation === "" || relation.startsWith("..") || isAbsolute(relation)) {
+    throw new Error(`${name} path escapes the yaca root`);
+  }
+}
 
-  return {
-    root,
-    agent: join(root, "agent"),
-    app: join(root, "app"),
-    content: join(root, "content"),
-    trash: join(root, "trash"),
-    logs: join(root, "logs"),
-    run: join(root, "run"),
-    temporary: join(root, "tmp"),
-  };
+async function prepareChild(root: string, name: string): Promise<string> {
+  const requestedPath = join(root, name);
+  await mkdir(requestedPath, { recursive: true });
+  const canonicalPath = await realpath(requestedPath);
+  assertContained(root, canonicalPath, name);
+  return canonicalPath;
+}
+
+export async function prepareYacaPaths(options: PrepareYacaPathsOptions = {}): Promise<YacaPaths> {
+  const requestedRoot = resolve(options.root ?? join(options.home ?? homedir(), ".yaca"));
+  await mkdir(requestedRoot, { recursive: true });
+  const root = await realpath(requestedRoot);
+
+  const [agent, app, content, trash, logs, run, temporary] = await Promise.all([
+    prepareChild(root, "agent"),
+    prepareChild(root, "app"),
+    prepareChild(root, "content"),
+    prepareChild(root, "trash"),
+    prepareChild(root, "logs"),
+    prepareChild(root, "run"),
+    prepareChild(root, "tmp"),
+  ]);
+
+  return { root, agent, app, content, trash, logs, run, temporary };
 }

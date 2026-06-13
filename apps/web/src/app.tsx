@@ -1,34 +1,34 @@
-import { BootstrapResponseSchema, Value, type BootstrapResponse } from "@yaca/contracts";
+import { HealthResponseSchema, Value, type HealthResponse } from "@yaca/contracts";
 import { CircleCheck, RotateCcw, Server } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
 import { Button } from "./components/ui/button.js";
 
-type BootstrapState =
+type HostStatusState =
   | { status: "loading" }
-  | { status: "ready"; bootstrap: BootstrapResponse }
+  | { status: "ready"; health: HealthResponse }
   | { status: "error"; message: string };
 
-async function fetchBootstrap(signal?: AbortSignal): Promise<BootstrapResponse> {
-  const response = await fetch("/api/bootstrap", {
+async function fetchHealth(signal?: AbortSignal): Promise<HealthResponse> {
+  const response = await fetch("/api/health", {
     headers: { accept: "application/json" },
     ...(signal ? { signal } : {}),
   });
   if (!response.ok) throw new Error(`Host returned HTTP ${response.status}`);
   const value: unknown = await response.json();
-  if (!Value.Check(BootstrapResponseSchema, value)) {
-    throw new Error("Host bootstrap did not match the supported schema");
+  if (!Value.Check(HealthResponseSchema, value)) {
+    throw new Error("Host health response did not match the supported schema");
   }
   return value;
 }
 
 export function App() {
-  const [state, setState] = useState<BootstrapState>({ status: "loading" });
+  const [state, setState] = useState<HostStatusState>({ status: "loading" });
 
-  const loadBootstrap = useCallback(async () => {
+  const loadHealth = useCallback(async () => {
     setState({ status: "loading" });
     try {
-      setState({ status: "ready", bootstrap: await fetchBootstrap() });
+      setState({ status: "ready", health: await fetchHealth() });
     } catch (error) {
       setState({
         status: "error",
@@ -39,8 +39,8 @@ export function App() {
 
   useEffect(() => {
     const controller = new AbortController();
-    void fetchBootstrap(controller.signal)
-      .then((bootstrap) => setState({ status: "ready", bootstrap }))
+    void fetchHealth(controller.signal)
+      .then((health) => setState({ status: "ready", health }))
       .catch((error: unknown) => {
         if (controller.signal.aborted) return;
         setState({
@@ -60,7 +60,7 @@ export function App() {
             <span className="text-muted-foreground text-xs">foundation</span>
           </div>
           <span className="text-muted-foreground font-mono text-xs">
-            {state.status === "ready" ? `v${state.bootstrap.version}` : "local Host"}
+            {state.status === "ready" ? `v${state.health.version}` : "local Host"}
           </span>
         </div>
       </header>
@@ -97,10 +97,8 @@ export function App() {
                   <dd className="mt-1 text-sm font-medium">Loopback only</dd>
                 </div>
                 <div className="bg-surface px-4 py-3">
-                  <dt className="text-muted-foreground text-xs">Protocol foundation</dt>
-                  <dd className="mt-1 font-mono text-sm">
-                    {state.bootstrap.protocol.major}.{state.bootstrap.protocol.minor}
-                  </dd>
+                  <dt className="text-muted-foreground text-xs">Status surface</dt>
+                  <dd className="mt-1 font-mono text-sm">/api/health</dd>
                 </div>
               </dl>
             </div>
@@ -115,7 +113,7 @@ export function App() {
                 </h1>
                 <p className="text-muted-foreground text-sm leading-6">{state.message}</p>
               </div>
-              <Button onClick={() => void loadBootstrap()}>
+              <Button onClick={() => void loadHealth()}>
                 <RotateCcw className="size-4" aria-hidden="true" />
                 Retry connection
               </Button>

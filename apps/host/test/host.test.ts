@@ -1,10 +1,10 @@
-import { BootstrapResponseSchema, HealthResponseSchema, Value } from "@yaca/contracts";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { HealthResponseSchema, Value } from "@yaca/contracts";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
-import { type RunningHost, startHost } from "../src/host.js";
+import { prepareYacaPaths, type RunningHost, startHost, type YacaPaths } from "@yaca/host";
 
 const runningHosts: RunningHost[] = [];
 const temporaryRoots: string[] = [];
@@ -16,29 +16,29 @@ afterEach(async () => {
   );
 });
 
+async function createPaths(): Promise<YacaPaths> {
+  const temporary = await mkdtemp(join(tmpdir(), "yaca-host-data-"));
+  temporaryRoots.push(temporary);
+  return prepareYacaPaths({ root: join(temporary, "data") });
+}
+
 describe("Host network boundary", () => {
   test("refuses a non-loopback bind address", async () => {
-    await expect(startHost({ host: "0.0.0.0", port: 0 })).rejects.toThrow(
-      "yaca only listens on 127.0.0.1",
-    );
+    await expect(
+      startHost({ host: "0.0.0.0", paths: await createPaths(), port: 0 }),
+    ).rejects.toThrow("yaca only listens on 127.0.0.1");
   });
 
-  test("serves schema-valid health and foundation bootstrap responses", async () => {
-    const host = await startHost({ port: 0 });
+  test("serves schema-valid health without pre-empting application bootstrap", async () => {
+    const host = await startHost({ paths: await createPaths(), port: 0 });
     runningHosts.push(host);
 
     const health = await fetch(`${host.url}/api/health`).then((response) => response.json());
-    const bootstrap = await fetch(`${host.url}/api/bootstrap`).then((response) => response.json());
+    const bootstrapResponse = await fetch(`${host.url}/api/bootstrap`);
 
     expect(Value.Check(HealthResponseSchema, health)).toBe(true);
     expect(health).toMatchObject({ service: "yaca-host", status: "ok", version: "0.1.0" });
-    expect(Value.Check(BootstrapResponseSchema, bootstrap)).toBe(true);
-    expect(bootstrap).toEqual({
-      application: "yaca",
-      capabilities: [],
-      protocol: { major: 1, minor: 0 },
-      version: "0.1.0",
-    });
+    expect(bootstrapResponse.status).toBe(404);
   });
 
   test("serves static assets and falls back to the Web shell for navigation routes", async () => {
@@ -48,18 +48,48 @@ describe("Host network boundary", () => {
     await writeFile(join(webRoot, "index.html"), "<!doctype html><title>yaca shell</title>");
     await writeFile(join(webRoot, "assets", "shell.js"), "globalThis.yacaShell = true;");
 
-    const host = await startHost({ port: 0, webRoot });
+    const host = await startHost({ paths: await createPaths(), port: 0, webRoot });
     runningHosts.push(host);
 
     const navigationResponse = await fetch(`${host.url}/sessions/example`);
     const assetResponse = await fetch(`${host.url}/assets/shell.js`);
-    const missingApiResponse = await fetch(`${host.url}/api/not-found`);
+    const apiResponses = await Promise.all(
+      [
+        "/api",
+        "/api/",
+        "/api/not-found",
+        "/%61pi",
+        "/%2561pi",
+        "/api%2fnot-found",
+        "/section/../api",
+        "//api",
+        "/%5capi",
+      ].map(async (path) => ({ path, response: await fetch(`${host.url}${path}`) })),
+    );
 
     expect(navigationResponse.status).toBe(200);
     expect(navigationResponse.headers.get("content-type")).toContain("text/html");
     expect(await navigationResponse.text()).toContain("yaca shell");
     expect(await assetResponse.text()).toBe("globalThis.yacaShell = true;");
-    expect(missingApiResponse.status).toBe(404);
-    expect(await missingApiResponse.text()).not.toContain("yaca shell");
+    for (const { path, response } of apiResponses) {
+      expect(response.status, path).toBeGreaterThanOrEqual(400);
+      expect(await response.text(), path).not.toContain("yaca shell");
+    }
+  });
+
+  test("holds one Host lock per yaca root and releases it on close", async () => {
+    const paths = await createPaths();
+    const first = await startHost({ paths, port: 0 });
+    runningHosts.push(first);
+
+    await expect(access(join(paths.run, "host.lock"))).resolves.toBeUndefined();
+    await expect(startHost({ paths, port: 0 })).rejects.toThrow("another yaca Host is running");
+
+    await first.close();
+    runningHosts.splice(runningHosts.indexOf(first), 1);
+    await expect(access(join(paths.run, "host.lock"))).rejects.toThrow();
+
+    const restarted = await startHost({ paths, port: 0 });
+    runningHosts.push(restarted);
   });
 });
