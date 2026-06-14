@@ -1,15 +1,16 @@
 import type { AddressInfo } from "node:net";
-import { join, posix } from "node:path";
+import { posix } from "node:path";
 
 import fastifyStatic from "@fastify/static";
 import type { HealthResponse } from "@yaca/contracts";
 import Fastify from "fastify";
-import { lock } from "proper-lockfile";
 
+import { acquireAuthorityFence } from "./authority-fence.js";
 import { YACA_VERSION } from "./version.js";
 import type { YacaPaths } from "./paths.js";
 
 export const LOOPBACK_HOST = "127.0.0.1";
+const SHUTDOWN_GRACE_MS = 2_000;
 
 export interface StartHostOptions {
   host?: string;
@@ -22,43 +23,7 @@ export interface RunningHost {
   host: typeof LOOPBACK_HOST;
   port: number;
   url: string;
-  safetyFailure: Promise<Error>;
   close(): Promise<void>;
-}
-
-async function acquireHostLock(
-  paths: YacaPaths,
-  onCompromised: (error: Error) => void,
-): Promise<() => Promise<void>> {
-  const lockPath = join(paths.run, "host.lock");
-  let compromised = false;
-  let releaseLease: () => Promise<void>;
-  try {
-    releaseLease = await lock(paths.run, {
-      lockfilePath: lockPath,
-      onCompromised: (error) => {
-        compromised = true;
-        onCompromised(error);
-      },
-      realpath: false,
-      retries: { factor: 1, maxTimeout: 500, minTimeout: 500, retries: 12 },
-      stale: 5_000,
-      update: 1_000,
-    });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ELOCKED") {
-      throw new Error("another yaca Host is running for this data root", { cause: error });
-    }
-    throw error;
-  }
-
-  let released = false;
-  return async () => {
-    if (released) return;
-    released = true;
-    if (compromised) return;
-    await releaseLease();
-  };
 }
 
 function isApiRequestTarget(requestTarget: string): boolean {
@@ -80,19 +45,28 @@ function isApiRequestTarget(requestTarget: string): boolean {
   return normalized === "/api" || normalized.startsWith("/api/");
 }
 
+async function closeApplication(app: ReturnType<typeof Fastify>): Promise<void> {
+  const forceTimer = setTimeout(() => {
+    app.server.closeIdleConnections();
+    app.server.closeAllConnections();
+  }, SHUTDOWN_GRACE_MS);
+  forceTimer.unref();
+  try {
+    await app.close();
+  } finally {
+    clearTimeout(forceTimer);
+  }
+}
+
 export async function startHost(options: StartHostOptions): Promise<RunningHost> {
   const host = options.host ?? LOOPBACK_HOST;
   if (host !== LOOPBACK_HOST) {
     throw new Error(`yaca only listens on ${LOOPBACK_HOST}`);
   }
 
+  const authorityFence = await acquireAuthorityFence(options.paths);
   const app = Fastify({ logger: false });
   const startedAt = process.hrtime.bigint();
-  let safetyFailed = false;
-  let resolveSafetyFailure!: (error: Error) => void;
-  const safetyFailure = new Promise<Error>((resolveFailure) => {
-    resolveSafetyFailure = resolveFailure;
-  });
 
   app.get(
     "/api/health",
@@ -119,29 +93,30 @@ export async function startHost(options: StartHostOptions): Promise<RunningHost>
     });
   }
 
-  const releaseHostLock = await acquireHostLock(options.paths, (cause) => {
-    if (safetyFailed) return;
-    safetyFailed = true;
-    const error = new Error("yaca Host lease was compromised; service stopped", { cause });
-    resolveSafetyFailure(error);
-    void app.close().catch(() => undefined);
-  });
-  app.addHook("onClose", releaseHostLock);
   try {
     await app.listen({ host, port: options.port ?? 3210 });
   } catch (error) {
     await app.close().catch(() => undefined);
-    await releaseHostLock();
+    await authorityFence.release();
     throw error;
   }
   const address = app.server.address() as AddressInfo;
   const url = `http://${host}:${address.port}`;
+  let closing: Promise<void> | undefined;
 
   return {
     host,
     port: address.port,
     url,
-    safetyFailure,
-    close: () => app.close(),
+    close: () => {
+      closing ??= (async () => {
+        try {
+          await closeApplication(app);
+        } finally {
+          await authorityFence.release();
+        }
+      })();
+      return closing;
+    },
   };
 }

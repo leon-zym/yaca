@@ -64,10 +64,6 @@ async function run(): Promise<void> {
   });
 
   process.stdout.write(`yaca listening at ${host.url}\n`);
-  void host.safetyFailure.then((error) => {
-    process.stderr.write(`yaca: ${error.message}\n`);
-    process.exitCode = 1;
-  });
 
   let closing = false;
   const close = async () => {

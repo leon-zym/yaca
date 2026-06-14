@@ -47,13 +47,14 @@ Useful options:
 
 The production CLI always uses `~/.yaca/`. If the root is missing, yaca creates it with owner-only
 permissions (`0700`) and canonicalizes it before the Host starts. It refuses a symbolic link at the
-data-root leaf and rejects derived paths that escape the canonical root. The Host holds an atomic,
-renewable lease at `~/.yaca/run/host.lock`, refreshing its modification time every second. A live
-lease blocks another Host. After SIGKILL or a fatal crash, the lease becomes stale after five
-seconds; startup retries are bounded to roughly six seconds so one contender can reclaim it. If
-heartbeat updates fail or the lease is otherwise compromised, the Host stops serving and reports a
-safety error. Tests inject temporary roots only through the Host package's module API. The
-foundation does not load `.env` files.
+data-root leaf and rejects derived paths that escape the canonical root. A stable hash of that root
+selects one yaca authority port in the reserved loopback range `49152–50175`. The Host binds that
+port exclusively before starting HTTP; the kernel socket is the ownership fence and is released
+immediately if the process exits or is killed. `~/.yaca/run/host.lock` is atomic diagnostic JSON
+only and never establishes ownership. A hash collision or unrelated local process on the derived
+port fails closed with a startup error. Graceful shutdown gives active HTTP connections two seconds
+before force-closing them, and releases the authority port last. Tests inject temporary roots only
+through the Host package's module API. The foundation does not load `.env` files.
 
 `GET /api/health` is liveness status for the local shell. It is not application bootstrap or
 authority state. Authentication, origin enforcement, and the application protocol gateway belong
@@ -94,11 +95,11 @@ pnpm check
 ```
 
 Tests use temporary filesystems and real loopback HTTP. They cover canonical runtime-root
-preparation, root-leaf and derived-path symlink rejection, owner-only root creation, live, stale,
-and compromised Host leases (including SIGKILL recovery and concurrent contenders), non-loopback
-rejection, the health schema, production and development CLI startup, and Web static fallback. The
-pack smoke builds a tarball, installs it into a fresh temporary consumer, and starts the installed
-`yaca` binary.
+preparation, root-leaf and derived-path symlink rejection, owner-only root creation, the kernel
+authority fence (including SIGKILL recovery, event-loop blocking, unrelated port ownership, and
+concurrent contenders), bounded connection shutdown, non-loopback rejection, the health schema,
+production and development CLI startup, and Web static fallback. The pack smoke builds a tarball,
+installs it into a fresh temporary consumer, and starts the installed `yaca` binary.
 
 ## Security boundary
 

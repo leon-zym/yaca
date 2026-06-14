@@ -1,5 +1,15 @@
 import { spawn } from "node:child_process";
-import { access, mkdtemp, mkdir, readdir, rename, rm, stat } from "node:fs/promises";
+import {
+  access,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -8,6 +18,7 @@ const hostRoot = resolve(import.meta.dirname, "..");
 const repositoryRoot = resolve(hostRoot, "../..");
 const cliPath = join(hostRoot, "dist", "cli.js");
 const temporaryRoots: string[] = [];
+const generatedFiles: string[] = [];
 const children = new Set<ReturnType<typeof spawn>>();
 
 afterEach(async () => {
@@ -16,6 +27,7 @@ afterEach(async () => {
   await Promise.all(
     temporaryRoots.splice(0).map((root) => rm(root, { force: true, recursive: true })),
   );
+  await Promise.all(generatedFiles.splice(0).map((path) => rm(path, { force: true })));
 });
 
 function runCli(
@@ -148,7 +160,7 @@ describe("yaca CLI", () => {
     children.delete(child);
   });
 
-  test("restarts within the declared stale window after SIGKILL", async () => {
+  test("restarts immediately after SIGKILL releases the kernel authority fence", async () => {
     const temporary = await mkdtemp(join(tmpdir(), "yaca-crash-cli-"));
     temporaryRoots.push(temporary);
     const home = join(temporary, "home");
@@ -182,7 +194,7 @@ describe("yaca CLI", () => {
 
     const crashed = start();
     await waitForUrl(crashed);
-    expect((await stat(lockPath)).isDirectory()).toBe(true);
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toMatchObject({ pid: crashed.pid });
     crashed.kill("SIGKILL");
     await new Promise((resolveExit) => crashed.once("exit", resolveExit));
     children.delete(crashed);
@@ -191,7 +203,8 @@ describe("yaca CLI", () => {
     const restartStartedAt = Date.now();
     const restarted = start();
     const restartedUrl = await waitForUrl(restarted);
-    expect(Date.now() - restartStartedAt).toBeLessThan(8_000);
+    expect(Date.now() - restartStartedAt).toBeLessThan(2_000);
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toMatchObject({ pid: restarted.pid });
     expect(
       await fetch(`${restartedUrl}/api/health`).then((response) => response.json()),
     ).toMatchObject({ status: "ok" });
@@ -199,13 +212,17 @@ describe("yaca CLI", () => {
     await new Promise((resolveExit) => restarted.once("exit", resolveExit));
     children.delete(restarted);
     await expect(access(lockPath)).rejects.toThrow();
-  }, 15_000);
+  }, 10_000);
 
-  test("exits with a safety error when the built CLI lease is compromised", async () => {
-    const temporary = await mkdtemp(join(tmpdir(), "yaca-compromised-cli-"));
+  test("exits within the shutdown deadline with a backpressured HTTP connection", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "yaca-shutdown-cli-"));
     temporaryRoots.push(temporary);
     const home = join(temporary, "home");
     await mkdir(home);
+    const largeAsset = resolve(hostRoot, "../web/dist/.shutdown-test.bin");
+    generatedFiles.push(largeAsset);
+    await writeFile(largeAsset, "");
+    await truncate(largeAsset, 64 * 1024 * 1024);
 
     const child = spawn(process.execPath, [cliPath, "start", "--port", "0"], {
       cwd: hostRoot,
@@ -214,31 +231,53 @@ describe("yaca CLI", () => {
     });
     children.add(child);
     child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    let stderr = "";
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
 
-    await new Promise<void>((resolveStarted, reject) => {
+    const url = await new Promise<string>((resolveStarted, reject) => {
       let output = "";
       const timeout = setTimeout(() => reject(new Error(`CLI did not start: ${output}`)), 10_000);
       child.stdout.on("data", (chunk) => {
         output += chunk;
-        if (output.includes("yaca listening at http://127.0.0.1:")) {
+        const match = output.match(/yaca listening at (http:\/\/127\.0\.0\.1:\d+)/);
+        if (match?.[1]) {
           clearTimeout(timeout);
-          resolveStarted();
+          resolveStarted(match[1]);
         }
       });
       child.on("exit", (code) => reject(new Error(`CLI exited early with ${String(code)}`)));
     });
 
-    const runRoot = join(home, ".yaca", "run");
-    await rename(join(runRoot, "host.lock"), join(runRoot, "host.lock-displaced"));
-    const code = await new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
-    children.delete(child);
+    const socket = createConnection(Number(new URL(url).port), "127.0.0.1");
+    await new Promise<void>((resolveConnected, reject) => {
+      socket.once("connect", resolveConnected);
+      socket.once("error", reject);
+    });
+    socket.write(
+      "GET /.shutdown-test.bin HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n",
+    );
+    await new Promise<void>((resolveReadable, reject) => {
+      socket.once("readable", resolveReadable);
+      socket.once("error", reject);
+    });
 
-    expect(code).toBe(1);
-    expect(stderr).toContain("yaca: yaca Host lease was compromised; service stopped");
-  });
+    const shutdownStartedAt = Date.now();
+    child.kill("SIGTERM");
+    const exit = new Promise<number | null>((resolveExit) => child.once("exit", resolveExit));
+    const code = await Promise.race([
+      exit,
+      new Promise<"deadline">((resolveDeadline) =>
+        setTimeout(() => resolveDeadline("deadline"), 3_000),
+      ),
+    ]);
+    socket.destroy();
+    if (code === "deadline") {
+      child.kill("SIGKILL");
+      await exit;
+    }
+    children.delete(child);
+    await rm(largeAsset, { force: true });
+    generatedFiles.splice(generatedFiles.indexOf(largeAsset), 1);
+
+    expect(code).toBe(0);
+    expect(Date.now() - shutdownStartedAt).toBeLessThan(2_750);
+  }, 10_000);
 });
