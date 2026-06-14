@@ -152,13 +152,21 @@ describe("Host network boundary", () => {
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
     });
-    const messages: Array<{ type: string; blockedMs?: number }> = [];
+    const messages: Array<{ type: string }> = [];
+    let resolveUnblocked!: () => void;
+    const unblocked = new Promise<void>((resolveUnexpected) => {
+      resolveUnblocked = resolveUnexpected;
+    });
     let wake: (() => void) | undefined;
     child.stdout.on("data", (chunk) => {
       output += chunk;
       const lines = output.split("\n");
       output = lines.pop() ?? "";
-      for (const line of lines) messages.push(JSON.parse(line));
+      for (const line of lines) {
+        const message = JSON.parse(line) as { type: string };
+        messages.push(message);
+        if (message.type === "unblocked") resolveUnblocked();
+      }
       wake?.();
       wake = undefined;
     });
@@ -178,15 +186,26 @@ describe("Host network boundary", () => {
       throw new Error(`blocking Host did not report ${type}: ${stderr}`);
     };
 
-    await waitForMessage("ready");
-    await expect(startHost({ paths, port: 0 })).rejects.toThrow("authority port");
-    const unblocked = await waitForMessage("unblocked");
-    expect(unblocked.blockedMs).toBeGreaterThanOrEqual(5_000);
+    await waitForMessage("blocking");
+    const contender = startHost({ paths, port: 0 }).then(
+      () => ({ type: "started" as const }),
+      (error: unknown) => ({ error, type: "rejected" as const }),
+    );
+    const outcome = await Promise.race([
+      contender,
+      unblocked.then(() => ({ type: "unblocked" as const })),
+    ]);
+    expect(outcome.type).toBe("rejected");
+    if (outcome.type === "rejected") expect(String(outcome.error)).toContain("authority port");
 
-    child.kill("SIGTERM");
-    await new Promise((resolveExit) => child.once("exit", resolveExit));
+    child.kill("SIGKILL");
+    const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })),
+    );
     children.delete(child);
-  }, 10_000);
+    expect(exit).toEqual({ code: null, signal: "SIGKILL" });
+    expect(messages.some((message) => message.type === "unblocked")).toBe(false);
+  }, 12_000);
 
   test("fails closed when an unrelated process owns the derived authority port", async () => {
     const paths = await createPaths();
