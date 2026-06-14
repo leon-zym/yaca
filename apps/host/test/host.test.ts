@@ -145,6 +145,9 @@ describe("Host network boundary", () => {
       stdio: ["ignore", "pipe", "pipe"],
     });
     children.add(child);
+    const childExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })),
+    );
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     let output = "";
@@ -186,23 +189,62 @@ describe("Host network boundary", () => {
       throw new Error(`blocking Host did not report ${type}: ${stderr}`);
     };
 
-    await waitForMessage("blocking");
-    const contender = startHost({ paths, port: 0 }).then(
-      () => ({ type: "started" as const }),
-      (error: unknown) => ({ error, type: "rejected" as const }),
-    );
-    const outcome = await Promise.race([
-      contender,
-      unblocked.then(() => ({ type: "unblocked" as const })),
-    ]);
-    expect(outcome.type).toBe("rejected");
-    if (outcome.type === "rejected") expect(String(outcome.error)).toContain("authority port");
+    let contender:
+      | Promise<{ host: RunningHost; type: "started" } | { error: unknown; type: "rejected" }>
+      | undefined;
+    let contenderHost: RunningHost | undefined;
+    let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    try {
+      await waitForMessage("blocking");
+      contender = startHost({ paths, port: 0 }).then(
+        (host) => {
+          contenderHost = host;
+          runningHosts.push(host);
+          return { host, type: "started" as const };
+        },
+        (error: unknown) => ({ error, type: "rejected" as const }),
+      );
+      const outcome = await Promise.race([
+        contender,
+        unblocked.then(() => ({ type: "unblocked" as const })),
+      ]);
+      expect(outcome.type).toBe("rejected");
+      if (outcome.type === "rejected") expect(String(outcome.error)).toContain("authority port");
+    } finally {
+      try {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        let exitTimeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          exit = await Promise.race([
+            childExit,
+            new Promise<never>((_resolve, reject) => {
+              exitTimeout = setTimeout(
+                () => reject(new Error("blocking Host did not terminate after SIGKILL")),
+                2_000,
+              );
+            }),
+          ]);
+        } finally {
+          if (exitTimeout) clearTimeout(exitTimeout);
+        }
+      } finally {
+        if (exit) children.delete(child);
 
-    child.kill("SIGKILL");
-    const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-      (resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })),
-    );
-    children.delete(child);
+        try {
+          await contender;
+        } finally {
+          if (contenderHost) {
+            try {
+              await contenderHost.close();
+            } finally {
+              const contenderIndex = runningHosts.indexOf(contenderHost);
+              if (contenderIndex !== -1) runningHosts.splice(contenderIndex, 1);
+            }
+          }
+        }
+      }
+    }
+
     expect(exit).toEqual({ code: null, signal: "SIGKILL" });
     expect(messages.some((message) => message.type === "unblocked")).toBe(false);
   }, 12_000);
