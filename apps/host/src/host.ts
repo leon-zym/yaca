@@ -1,11 +1,10 @@
-import { randomUUID } from "node:crypto";
-import { link, open, readFile, rename, rm, unlink } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { join, posix } from "node:path";
 
 import fastifyStatic from "@fastify/static";
 import type { HealthResponse } from "@yaca/contracts";
 import Fastify from "fastify";
+import { lock } from "proper-lockfile";
 
 import { YACA_VERSION } from "./version.js";
 import type { YacaPaths } from "./paths.js";
@@ -23,127 +22,42 @@ export interface RunningHost {
   host: typeof LOOPBACK_HOST;
   port: number;
   url: string;
+  safetyFailure: Promise<Error>;
   close(): Promise<void>;
 }
 
-interface HostLockRecord {
-  pid: number;
-  instanceId: string;
-  startedAt: string;
-}
-
-function parseHostLock(contents: string): HostLockRecord | undefined {
-  try {
-    const value = JSON.parse(contents) as Record<string, unknown>;
-    if (
-      !Number.isSafeInteger(value.pid) ||
-      (value.pid as number) <= 0 ||
-      typeof value.instanceId !== "string" ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
-        value.instanceId,
-      ) ||
-      typeof value.startedAt !== "string" ||
-      !Number.isFinite(Date.parse(value.startedAt))
-    ) {
-      return undefined;
-    }
-    return value as unknown as HostLockRecord;
-  } catch {
-    return undefined;
-  }
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
-  }
-}
-
-async function restoreClaimedLock(claimedPath: string, lockPath: string): Promise<void> {
-  try {
-    await link(claimedPath, lockPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-  }
-}
-
-async function acquireHostLock(paths: YacaPaths): Promise<() => Promise<void>> {
+async function acquireHostLock(
+  paths: YacaPaths,
+  onCompromised: (error: Error) => void,
+): Promise<() => Promise<void>> {
   const lockPath = join(paths.run, "host.lock");
-  const instanceId = randomUUID();
-  const candidatePath = join(paths.run, `host.lock.candidate-${instanceId}`);
-  const record: HostLockRecord = {
-    pid: process.pid,
-    instanceId,
-    startedAt: new Date().toISOString(),
-  };
-  const candidate = await open(candidatePath, "wx", 0o600);
+  let compromised = false;
+  let releaseLease: () => Promise<void>;
   try {
-    await candidate.writeFile(`${JSON.stringify(record)}\n`);
-    await candidate.sync();
-  } finally {
-    await candidate.close();
-  }
-
-  try {
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      try {
-        await link(candidatePath, lockPath);
-        break;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      }
-
-      let observedContents: string;
-      try {
-        observedContents = await readFile(lockPath, "utf8");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-        throw error;
-      }
-      const observedRecord = parseHostLock(observedContents);
-      if (observedRecord && isProcessAlive(observedRecord.pid)) {
-        throw new Error("another yaca Host is running for this data root");
-      }
-
-      const claimedPath = join(paths.run, `host.lock.stale-${randomUUID()}`);
-      try {
-        await rename(lockPath, claimedPath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-        throw error;
-      }
-
-      const claimedContents = await readFile(claimedPath, "utf8").catch(() => "");
-      if (claimedContents !== observedContents) {
-        await restoreClaimedLock(claimedPath, lockPath);
-      }
-      await rm(claimedPath, { force: true });
+    releaseLease = await lock(paths.run, {
+      lockfilePath: lockPath,
+      onCompromised: (error) => {
+        compromised = true;
+        onCompromised(error);
+      },
+      realpath: false,
+      retries: { factor: 1, maxTimeout: 500, minTimeout: 500, retries: 12 },
+      stale: 5_000,
+      update: 1_000,
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOCKED") {
+      throw new Error("another yaca Host is running for this data root", { cause: error });
     }
-
-    const installedRecord = await readFile(lockPath, "utf8").then(parseHostLock);
-    if (installedRecord?.instanceId !== instanceId) {
-      if (installedRecord && isProcessAlive(installedRecord.pid)) {
-        throw new Error("another yaca Host is running for this data root");
-      }
-      throw new Error("unable to acquire the yaca Host lock safely");
-    }
-  } finally {
-    await rm(candidatePath, { force: true });
+    throw error;
   }
 
   let released = false;
   return async () => {
     if (released) return;
     released = true;
-    try {
-      const current = await readFile(lockPath, "utf8").then(parseHostLock);
-      if (current?.instanceId === instanceId) await unlink(lockPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
+    if (compromised) return;
+    await releaseLease();
   };
 }
 
@@ -174,6 +88,11 @@ export async function startHost(options: StartHostOptions): Promise<RunningHost>
 
   const app = Fastify({ logger: false });
   const startedAt = process.hrtime.bigint();
+  let safetyFailed = false;
+  let resolveSafetyFailure!: (error: Error) => void;
+  const safetyFailure = new Promise<Error>((resolveFailure) => {
+    resolveSafetyFailure = resolveFailure;
+  });
 
   app.get(
     "/api/health",
@@ -200,7 +119,13 @@ export async function startHost(options: StartHostOptions): Promise<RunningHost>
     });
   }
 
-  const releaseHostLock = await acquireHostLock(options.paths);
+  const releaseHostLock = await acquireHostLock(options.paths, (cause) => {
+    if (safetyFailed) return;
+    safetyFailed = true;
+    const error = new Error("yaca Host lease was compromised; service stopped", { cause });
+    resolveSafetyFailure(error);
+    void app.close().catch(() => undefined);
+  });
   app.addHook("onClose", releaseHostLock);
   try {
     await app.listen({ host, port: options.port ?? 3210 });
@@ -216,6 +141,7 @@ export async function startHost(options: StartHostOptions): Promise<RunningHost>
     host,
     port: address.port,
     url,
+    safetyFailure,
     close: () => app.close(),
   };
 }
