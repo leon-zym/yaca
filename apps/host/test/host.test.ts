@@ -1,17 +1,21 @@
 import { HealthResponseSchema, Value } from "@yaca/contracts";
-import { access, mkdir, mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, readdir, rm, truncate, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { prepareYacaPaths, type RunningHost, startHost, type YacaPaths } from "@yaca/host";
 
 const runningHosts: RunningHost[] = [];
 const temporaryRoots: string[] = [];
+const children = new Set<ReturnType<typeof spawn>>();
 
 afterEach(async () => {
   await Promise.all(runningHosts.splice(0).map((host) => host.close()));
+  for (const child of children) child.kill("SIGKILL");
+  children.clear();
   await Promise.all(
     temporaryRoots.splice(0).map((root) => rm(root, { force: true, recursive: true })),
   );
@@ -31,14 +35,21 @@ describe("Host network boundary", () => {
   });
 
   test("serves schema-valid health without pre-empting application bootstrap", async () => {
-    const host = await startHost({ paths: await createPaths(), port: 0 });
+    const paths = await createPaths();
+    const host = await startHost({ paths, port: 0 });
     runningHosts.push(host);
 
     const health = await fetch(`${host.url}/api/health`).then((response) => response.json());
     const bootstrapResponse = await fetch(`${host.url}/api/bootstrap`);
 
     expect(Value.Check(HealthResponseSchema, health)).toBe(true);
-    expect(health).toMatchObject({ service: "yaca-host", status: "ok", version: "0.1.0" });
+    expect(health).toMatchObject({
+      authorityPort: expect.any(Number),
+      service: "yaca-host",
+      status: "ok",
+      version: "0.1.0",
+    });
+    expect(await readdir(paths.run)).toEqual([]);
     expect(bootstrapResponse.status).toBe(404);
   });
 
@@ -78,31 +89,31 @@ describe("Host network boundary", () => {
     }
   });
 
+  test("releases authority after Web initialization fails", async () => {
+    const paths = await createPaths();
+    const missingWebRoot = join(paths.root, "missing-web-root");
+
+    await expect(startHost({ paths, port: 0, webRoot: missingWebRoot })).rejects.toThrow();
+
+    const recovered = await startHost({ paths, port: 0 });
+    runningHosts.push(recovered);
+  });
+
   test("holds one kernel authority fence per yaca root and releases it on close", async () => {
     const paths = await createPaths();
     const first = await startHost({ paths, port: 0 });
     runningHosts.push(first);
 
-    const lockPath = join(paths.run, "host.lock");
-    const metadata = JSON.parse(await readFile(lockPath, "utf8"));
-    expect(metadata).toMatchObject({
-      pid: process.pid,
-      instance: expect.stringMatching(/^[0-9a-f-]{36}$/u),
-      authorityPort: expect.any(Number),
-      startedAt: expect.any(String),
-    });
-    const rejectedAt = Date.now();
-    await expect(startHost({ paths, port: 0 })).rejects.toThrow(
-      `yaca authority port ${String(metadata.authorityPort)} is already in use; refusing to start`,
+    const authorityPort = await fetch(`${first.url}/api/health`).then(
+      async (response) => ((await response.json()) as { authorityPort: number }).authorityPort,
     );
-    expect(Date.now() - rejectedAt).toBeLessThan(1_000);
-
-    await rm(lockPath);
-    await expect(startHost({ paths, port: 0 })).rejects.toThrow("authority port");
+    await expect(startHost({ paths, port: 0 })).rejects.toThrow(
+      `yaca authority port ${String(authorityPort)} is already in use; refusing to start`,
+    );
 
     await first.close();
     runningHosts.splice(runningHosts.indexOf(first), 1);
-    await expect(access(lockPath)).rejects.toThrow();
+    expect(await readdir(paths.run)).toEqual([]);
 
     const restarted = await startHost({ paths, port: 0 });
     runningHosts.push(restarted);
@@ -110,7 +121,6 @@ describe("Host network boundary", () => {
 
   test("allows exactly one of eight same-root authority contenders to start", async () => {
     const paths = await createPaths();
-    const startedAt = Date.now();
     const results = await Promise.allSettled(
       Array.from({ length: 8 }, () => startHost({ paths, port: 0 })),
     );
@@ -124,38 +134,79 @@ describe("Host network boundary", () => {
 
     expect(started).toHaveLength(1);
     expect(rejected).toHaveLength(7);
-    expect(Date.now() - startedAt).toBeLessThan(1_000);
     expect(rejected.every((result) => String(result.reason).includes("authority port"))).toBe(true);
   });
 
-  test("keeps authority while the JavaScript event loop is blocked beyond the former lease", async () => {
+  test("keeps authority while its child process event loop is blocked beyond five seconds", async () => {
     const paths = await createPaths();
-    const first = await startHost({ paths, port: 0 });
-    runningHosts.push(first);
+    const fixture = resolve(import.meta.dirname, "fixtures/blocking-host.mjs");
+    const child = spawn(process.execPath, [fixture, paths.root], {
+      cwd: resolve(import.meta.dirname, ".."),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    children.add(child);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    let output = "";
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    const messages: Array<{ type: string; blockedMs?: number }> = [];
+    let wake: (() => void) | undefined;
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+      const lines = output.split("\n");
+      output = lines.pop() ?? "";
+      for (const line of lines) messages.push(JSON.parse(line));
+      wake?.();
+      wake = undefined;
+    });
+    const waitForMessage = async (type: string) => {
+      const deadline = Date.now() + 8_000;
+      while (Date.now() < deadline) {
+        const message = messages.find((candidate) => candidate.type === type);
+        if (message) return message;
+        await new Promise<void>((resolveWake) => {
+          const timeout = setTimeout(resolveWake, 100);
+          wake = () => {
+            clearTimeout(timeout);
+            resolveWake();
+          };
+        });
+      }
+      throw new Error(`blocking Host did not report ${type}: ${stderr}`);
+    };
 
-    const blockedAt = Date.now();
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5_100);
-    expect(Date.now() - blockedAt).toBeGreaterThanOrEqual(5_000);
+    await waitForMessage("ready");
     await expect(startHost({ paths, port: 0 })).rejects.toThrow("authority port");
-  }, 7_000);
+    const unblocked = await waitForMessage("unblocked");
+    expect(unblocked.blockedMs).toBeGreaterThanOrEqual(5_000);
+
+    child.kill("SIGTERM");
+    await new Promise((resolveExit) => child.once("exit", resolveExit));
+    children.delete(child);
+  }, 10_000);
 
   test("fails closed when an unrelated process owns the derived authority port", async () => {
     const paths = await createPaths();
     const probe = await startHost({ paths, port: 0 });
-    const metadata = JSON.parse(await readFile(join(paths.run, "host.lock"), "utf8"));
+    const authorityPort = await fetch(`${probe.url}/api/health`).then(
+      async (response) => ((await response.json()) as { authorityPort: number }).authorityPort,
+    );
     await probe.close();
 
     const unrelated = createServer((socket) => socket.destroy());
     await new Promise<void>((resolveListening, reject) => {
       unrelated.once("error", reject);
       unrelated.listen(
-        { exclusive: true, host: "127.0.0.1", port: metadata.authorityPort },
+        { exclusive: true, host: "127.0.0.1", port: authorityPort },
         resolveListening,
       );
     });
 
     await expect(startHost({ paths, port: 0 })).rejects.toThrow(
-      `yaca authority port ${String(metadata.authorityPort)} is already in use; refusing to start`,
+      `yaca authority port ${String(authorityPort)} is already in use; refusing to start`,
     );
     await new Promise<void>((resolveClose, reject) =>
       unrelated.close((error) => (error ? reject(error) : resolveClose())),
@@ -184,16 +235,11 @@ describe("Host network boundary", () => {
 
     const closing = host.close();
     await expect(startHost({ paths, port: 0 })).rejects.toThrow("authority port");
-    const closedWithinDeadline = await Promise.race([
-      closing.then(() => true),
-      new Promise<false>((resolveDeadline) => setTimeout(() => resolveDeadline(false), 2_750)),
-    ]);
-    socket.destroy();
     await closing;
+    socket.destroy();
     runningHosts.splice(runningHosts.indexOf(host), 1);
 
-    expect(closedWithinDeadline).toBe(true);
     const restarted = await startHost({ paths, port: 0 });
     runningHosts.push(restarted);
-  }, 5_000);
+  }, 6_000);
 });

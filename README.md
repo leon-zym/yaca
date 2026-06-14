@@ -50,11 +50,12 @@ permissions (`0700`) and canonicalizes it before the Host starts. It refuses a s
 data-root leaf and rejects derived paths that escape the canonical root. A stable hash of that root
 selects one yaca authority port in the reserved loopback range `49152–50175`. The Host binds that
 port exclusively before starting HTTP; the kernel socket is the ownership fence and is released
-immediately if the process exits or is killed. `~/.yaca/run/host.lock` is atomic diagnostic JSON
-only and never establishes ownership. A hash collision or unrelated local process on the derived
-port fails closed with a startup error. Graceful shutdown gives active HTTP connections two seconds
-before force-closing them, and releases the authority port last. Tests inject temporary roots only
-through the Host package's module API. The foundation does not load `.env` files.
+immediately if the process exits or is killed. No ownership or diagnostic lock file is written to
+disk; the non-sensitive derived port is visible through `/api/health`. A hash collision or
+unrelated local process on the derived port fails closed with a startup error. Graceful shutdown
+gives active HTTP connections two seconds before force-closing them, and releases the authority
+port last. Tests inject temporary roots only through the Host package's module API. The foundation
+does not load `.env` files.
 
 `GET /api/health` is liveness status for the local shell. It is not application bootstrap or
 authority state. Authentication, origin enforcement, and the application protocol gateway belong

@@ -1,3 +1,4 @@
+import { stat } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { posix } from "node:path";
 
@@ -65,58 +66,66 @@ export async function startHost(options: StartHostOptions): Promise<RunningHost>
   }
 
   const authorityFence = await acquireAuthorityFence(options.paths);
-  const app = Fastify({ logger: false });
-  const startedAt = process.hrtime.bigint();
-
-  app.get(
-    "/api/health",
-    async (): Promise<HealthResponse> => ({
-      status: "ok",
-      service: "yaca-host",
-      version: YACA_VERSION,
-      uptimeSeconds: Number(process.hrtime.bigint() - startedAt) / 1_000_000_000,
-    }),
-  );
-
-  if (options.webRoot) {
-    await app.register(fastifyStatic, {
-      root: options.webRoot,
-      prefix: "/",
-    });
-
-    app.setNotFoundHandler(async (request, reply) => {
-      if (request.method === "GET" && !isApiRequestTarget(request.url)) {
-        return reply.type("text/html; charset=utf-8").sendFile("index.html");
-      }
-
-      return reply.code(404).send({ error: "not_found" });
-    });
-  }
-
+  let app: ReturnType<typeof Fastify> | undefined;
   try {
-    await app.listen({ host, port: options.port ?? 3210 });
+    const hostApp = Fastify({ logger: false });
+    app = hostApp;
+    const startedAt = process.hrtime.bigint();
+
+    hostApp.get(
+      "/api/health",
+      async (): Promise<HealthResponse> => ({
+        authorityPort: authorityFence.port,
+        status: "ok",
+        service: "yaca-host",
+        version: YACA_VERSION,
+        uptimeSeconds: Number(process.hrtime.bigint() - startedAt) / 1_000_000_000,
+      }),
+    );
+
+    if (options.webRoot) {
+      const webRootStat = await stat(options.webRoot).catch(() => undefined);
+      if (!webRootStat?.isDirectory()) {
+        throw new Error("yaca Web root must be an existing directory");
+      }
+      await hostApp.register(fastifyStatic, {
+        root: options.webRoot,
+        prefix: "/",
+      });
+
+      hostApp.setNotFoundHandler(async (request, reply) => {
+        if (request.method === "GET" && !isApiRequestTarget(request.url)) {
+          return reply.type("text/html; charset=utf-8").sendFile("index.html");
+        }
+
+        return reply.code(404).send({ error: "not_found" });
+      });
+    }
+
+    await hostApp.ready();
+    await hostApp.listen({ host, port: options.port ?? 3210 });
+    const address = hostApp.server.address() as AddressInfo;
+    const url = `http://${host}:${address.port}`;
+    let closing: Promise<void> | undefined;
+
+    return {
+      host,
+      port: address.port,
+      url,
+      close: () => {
+        closing ??= (async () => {
+          try {
+            await closeApplication(hostApp);
+          } finally {
+            await authorityFence.release();
+          }
+        })();
+        return closing;
+      },
+    };
   } catch (error) {
-    await app.close().catch(() => undefined);
+    if (app) await closeApplication(app).catch(() => undefined);
     await authorityFence.release();
     throw error;
   }
-  const address = app.server.address() as AddressInfo;
-  const url = `http://${host}:${address.port}`;
-  let closing: Promise<void> | undefined;
-
-  return {
-    host,
-    port: address.port,
-    url,
-    close: () => {
-      closing ??= (async () => {
-        try {
-          await closeApplication(app);
-        } finally {
-          await authorityFence.release();
-        }
-      })();
-      return closing;
-    },
-  };
 }
