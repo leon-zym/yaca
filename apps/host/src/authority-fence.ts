@@ -4,17 +4,22 @@ import { createServer, type Server } from "node:net";
 import type { YacaPaths } from "./paths.js";
 
 const AUTHORITY_PORT_BASE = 49_152;
-const AUTHORITY_PORT_COUNT = 1_024;
+const AUTHORITY_PORT_COUNT = 16_384;
 const LOOPBACK_HOST = "127.0.0.1";
 
 export interface AuthorityFence {
-  port: number;
+  ports: [number, number];
   release(): Promise<void>;
 }
 
-function authorityPortForRoot(root: string): number {
+function authorityPortsForRoot(root: string): [number, number] {
   const digest = createHash("sha256").update(root).digest();
-  return AUTHORITY_PORT_BASE + (digest.readUInt32BE(0) % AUTHORITY_PORT_COUNT);
+  const first = AUTHORITY_PORT_BASE + (digest.readUInt32BE(0) % AUTHORITY_PORT_COUNT);
+  let second = AUTHORITY_PORT_BASE + (digest.readUInt32BE(4) % AUTHORITY_PORT_COUNT);
+  if (second === first) {
+    second = AUTHORITY_PORT_BASE + ((second - AUTHORITY_PORT_BASE + 1) % AUTHORITY_PORT_COUNT);
+  }
+  return [first, second];
 }
 
 async function closeServer(server: Server): Promise<void> {
@@ -50,17 +55,42 @@ async function bindAuthorityPort(port: number): Promise<Server> {
   }
 }
 
+async function closeAuthorityServers(servers: Server[]): Promise<void> {
+  const errors: unknown[] = [];
+  for (const server of servers.toReversed()) {
+    try {
+      await closeServer(server);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length > 0) throw new AggregateError(errors, "failed to release yaca authority ports");
+}
+
 export async function acquireAuthorityFence(paths: YacaPaths): Promise<AuthorityFence> {
-  const port = authorityPortForRoot(paths.root);
-  const server = await bindAuthorityPort(port);
+  const ports = authorityPortsForRoot(paths.root);
+  const servers: Server[] = [];
+  try {
+    for (const port of ports) servers.push(await bindAuthorityPort(port));
+  } catch (error) {
+    try {
+      await closeAuthorityServers(servers);
+    } catch (releaseError) {
+      throw new AggregateError(
+        [error, releaseError],
+        "failed to acquire and roll back yaca authority ports",
+      );
+    }
+    throw error;
+  }
 
   let released = false;
   return {
-    port,
+    ports,
     release: async () => {
       if (released) return;
       released = true;
-      await closeServer(server);
+      await closeAuthorityServers(servers);
     },
   };
 }

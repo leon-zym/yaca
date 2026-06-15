@@ -184,7 +184,7 @@ describe("yaca CLI", () => {
     const crashedUrl = await waitForUrl(crashed);
     const crashedHealth = (await fetch(`${crashedUrl}/api/health`).then((response) =>
       response.json(),
-    )) as { authorityPort: number };
+    )) as { authorityPorts: [number, number] };
     crashed.kill("SIGKILL");
     await new Promise((resolveExit) => crashed.once("exit", resolveExit));
     children.delete(crashed);
@@ -195,7 +195,7 @@ describe("yaca CLI", () => {
       response.json(),
     );
     expect(restartedHealth).toMatchObject({
-      authorityPort: crashedHealth.authorityPort,
+      authorityPorts: crashedHealth.authorityPorts,
       status: "ok",
     });
     restarted.kill("SIGTERM");

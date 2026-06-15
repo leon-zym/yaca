@@ -75,7 +75,7 @@ export async function startHost(options: StartHostOptions): Promise<RunningHost>
     hostApp.get(
       "/api/health",
       async (): Promise<HealthResponse> => ({
-        authorityPort: authorityFence.port,
+        authorityPorts: authorityFence.ports,
         status: "ok",
         service: "yaca-host",
         version: YACA_VERSION,

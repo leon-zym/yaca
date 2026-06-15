@@ -1,7 +1,7 @@
 import { HealthResponseSchema, Value } from "@yaca/contracts";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readdir, rm, truncate, writeFile } from "node:fs/promises";
-import { createConnection, createServer } from "node:net";
+import { createConnection, createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -11,11 +11,13 @@ import { prepareYacaPaths, type RunningHost, startHost, type YacaPaths } from "@
 const runningHosts: RunningHost[] = [];
 const temporaryRoots: string[] = [];
 const children = new Set<ReturnType<typeof spawn>>();
+const authorityBlockers = new Set<Server>();
 
 afterEach(async () => {
   await Promise.all(runningHosts.splice(0).map((host) => host.close()));
   for (const child of children) child.kill("SIGKILL");
   children.clear();
+  await Promise.all([...authorityBlockers].map((server) => closeAuthorityBlocker(server)));
   await Promise.all(
     temporaryRoots.splice(0).map((root) => rm(root, { force: true, recursive: true })),
   );
@@ -25,6 +27,32 @@ async function createPaths(): Promise<YacaPaths> {
   const temporary = await mkdtemp(join(tmpdir(), "yaca-host-data-"));
   temporaryRoots.push(temporary);
   return prepareYacaPaths({ root: join(temporary, "data") });
+}
+
+async function readAuthorityPorts(host: RunningHost): Promise<[number, number]> {
+  return fetch(`${host.url}/api/health`).then(
+    async (response) =>
+      ((await response.json()) as { authorityPorts: [number, number] }).authorityPorts,
+  );
+}
+
+async function bindAuthorityBlocker(port: number): Promise<Server> {
+  const server = createServer((socket) => socket.destroy());
+  authorityBlockers.add(server);
+  await new Promise<void>((resolveListening, reject) => {
+    server.once("error", reject);
+    server.listen({ exclusive: true, host: "127.0.0.1", port }, resolveListening);
+  });
+  return server;
+}
+
+async function closeAuthorityBlocker(server: Server): Promise<void> {
+  if (server.listening) {
+    await new Promise<void>((resolveClose, reject) =>
+      server.close((error) => (error ? reject(error) : resolveClose())),
+    );
+  }
+  authorityBlockers.delete(server);
 }
 
 describe("Host network boundary", () => {
@@ -44,7 +72,7 @@ describe("Host network boundary", () => {
 
     expect(Value.Check(HealthResponseSchema, health)).toBe(true);
     expect(health).toMatchObject({
-      authorityPort: expect.any(Number),
+      authorityPorts: [expect.any(Number), expect.any(Number)],
       service: "yaca-host",
       status: "ok",
       version: "0.1.0",
@@ -104,11 +132,10 @@ describe("Host network boundary", () => {
     const first = await startHost({ paths, port: 0 });
     runningHosts.push(first);
 
-    const authorityPort = await fetch(`${first.url}/api/health`).then(
-      async (response) => ((await response.json()) as { authorityPort: number }).authorityPort,
-    );
+    const authorityPorts = await readAuthorityPorts(first);
+    expect(new Set(authorityPorts).size).toBe(2);
     await expect(startHost({ paths, port: 0 })).rejects.toThrow(
-      `yaca authority port ${String(authorityPort)} is already in use; refusing to start`,
+      `yaca authority port ${String(authorityPorts[0])} is already in use; refusing to start`,
     );
 
     await first.close();
@@ -117,6 +144,21 @@ describe("Host network boundary", () => {
 
     const restarted = await startHost({ paths, port: 0 });
     runningHosts.push(restarted);
+    expect(await readAuthorityPorts(restarted)).toEqual(authorityPorts);
+  });
+
+  test("derives unique authority port pairs for many distinct roots", async () => {
+    const pairs: string[] = [];
+    for (let index = 0; index < 64; index += 1) {
+      const host = await startHost({ paths: await createPaths(), port: 0 });
+      runningHosts.push(host);
+      const ports = await readAuthorityPorts(host);
+      pairs.push(ports.join(":"));
+      await host.close();
+      runningHosts.splice(runningHosts.indexOf(host), 1);
+    }
+
+    expect(new Set(pairs).size).toBe(64);
   });
 
   test("allows exactly one of eight same-root authority contenders to start", async () => {
@@ -249,29 +291,38 @@ describe("Host network boundary", () => {
     expect(messages.some((message) => message.type === "unblocked")).toBe(false);
   }, 12_000);
 
-  test("fails closed when an unrelated process owns the derived authority port", async () => {
+  test("fails closed when an unrelated process owns either derived authority port", async () => {
     const paths = await createPaths();
     const probe = await startHost({ paths, port: 0 });
-    const authorityPort = await fetch(`${probe.url}/api/health`).then(
-      async (response) => ((await response.json()) as { authorityPort: number }).authorityPort,
-    );
+    runningHosts.push(probe);
+    const authorityPorts = await readAuthorityPorts(probe);
     await probe.close();
+    runningHosts.splice(runningHosts.indexOf(probe), 1);
 
-    const unrelated = createServer((socket) => socket.destroy());
-    await new Promise<void>((resolveListening, reject) => {
-      unrelated.once("error", reject);
-      unrelated.listen(
-        { exclusive: true, host: "127.0.0.1", port: authorityPort },
-        resolveListening,
+    for (const authorityPort of authorityPorts) {
+      const unrelated = await bindAuthorityBlocker(authorityPort);
+      await expect(startHost({ paths, port: 0 })).rejects.toThrow(
+        `yaca authority port ${String(authorityPort)} is already in use; refusing to start`,
       );
-    });
+      await closeAuthorityBlocker(unrelated);
+    }
+  });
 
+  test("releases the first authority port when binding the second fails", async () => {
+    const paths = await createPaths();
+    const probe = await startHost({ paths, port: 0 });
+    runningHosts.push(probe);
+    const authorityPorts = await readAuthorityPorts(probe);
+    await probe.close();
+    runningHosts.splice(runningHosts.indexOf(probe), 1);
+
+    const secondPortOwner = await bindAuthorityBlocker(authorityPorts[1]);
     await expect(startHost({ paths, port: 0 })).rejects.toThrow(
-      `yaca authority port ${String(authorityPort)} is already in use; refusing to start`,
+      `yaca authority port ${String(authorityPorts[1])} is already in use; refusing to start`,
     );
-    await new Promise<void>((resolveClose, reject) =>
-      unrelated.close((error) => (error ? reject(error) : resolveClose())),
-    );
+    const firstPortOwner = await bindAuthorityBlocker(authorityPorts[0]);
+    await closeAuthorityBlocker(firstPortOwner);
+    await closeAuthorityBlocker(secondPortOwner);
   });
 
   test("bounds shutdown while an HTTP response remains backpressured", async () => {

@@ -9,7 +9,10 @@ export const HealthResponseSchema = Type.Object(
     service: Type.Literal("yaca-host"),
     version: Type.String({ minLength: 1, maxLength: 128 }),
     uptimeSeconds: Type.Number({ minimum: 0 }),
-    authorityPort: Type.Integer({ minimum: 49_152, maximum: 50_175 }),
+    authorityPorts: Type.Tuple([
+      Type.Integer({ minimum: 49_152, maximum: 65_535 }),
+      Type.Integer({ minimum: 49_152, maximum: 65_535 }),
+    ]),
   },
   { additionalProperties: false },
 );
