@@ -53,11 +53,12 @@ private loopback range `49152–65535`. The Host binds both ports exclusively be
 the pair of kernel sockets is the ownership fence and is released immediately if the process exits
 or is killed. If either bind fails, startup releases any socket already acquired and fails closed.
 No ownership or diagnostic lock file is written to disk; the non-sensitive derived port pair is
-visible through `/api/health`. A hash collision or unrelated local process on either derived port
-fails closed with a startup error naming the conflicting port. Graceful shutdown gives active HTTP
-connections two seconds before force-closing them, then releases both authority ports in reverse
-acquisition order. Tests inject temporary roots only through the Host package's module API. The
-foundation does not load `.env` files.
+visible through `/api/health`. If two different roots share either derived port, yaca conservatively
+refuses the later start; an unrelated local process on either port has the same fail-closed result.
+The startup error names the conflicting port. Graceful shutdown gives active HTTP connections two
+seconds before force-closing them, then releases both authority ports in reverse acquisition order.
+Tests inject temporary roots only through the Host package's module API. The foundation does not
+load `.env` files.
 
 `GET /api/health` is liveness status for the local shell. It is not application bootstrap or
 authority state. Authentication, origin enforcement, and the application protocol gateway belong

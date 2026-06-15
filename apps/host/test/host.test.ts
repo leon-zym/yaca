@@ -147,19 +147,61 @@ describe("Host network boundary", () => {
     expect(await readAuthorityPorts(restarted)).toEqual(authorityPorts);
   });
 
-  test("derives unique authority port pairs for many distinct roots", async () => {
-    const pairs: string[] = [];
-    for (let index = 0; index < 64; index += 1) {
-      const host = await startHost({ paths: await createPaths(), port: 0 });
-      runningHosts.push(host);
-      const ports = await readAuthorityPorts(host);
-      pairs.push(ports.join(":"));
-      await host.close();
-      runningHosts.splice(runningHosts.indexOf(host), 1);
+  test("starts distinct roots concurrently when their authority port sets do not overlap", async () => {
+    const candidateRoot = await mkdtemp(join(tmpdir(), "yaca-authority-candidates-"));
+    temporaryRoots.push(candidateRoot);
+    const selected: Array<{ paths: YacaPaths; ports: [number, number] }> = [];
+    const selectedPorts = new Set<number>();
+    const targetCount = 32;
+    const candidateLimit = 256;
+
+    for (let index = 0; index < candidateLimit && selected.length < targetCount; index += 1) {
+      const paths = await prepareYacaPaths({ root: join(candidateRoot, `candidate-${index}`) });
+      let probe: RunningHost;
+      try {
+        probe = await startHost({ paths, port: 0 });
+      } catch (error) {
+        if (String(error).includes("authority port")) continue;
+        throw error;
+      }
+      runningHosts.push(probe);
+      let ports: [number, number];
+      try {
+        ports = await readAuthorityPorts(probe);
+      } finally {
+        await probe.close();
+        runningHosts.splice(runningHosts.indexOf(probe), 1);
+      }
+      if (ports.some((port) => selectedPorts.has(port))) continue;
+      selected.push({ paths, ports });
+      for (const port of ports) selectedPorts.add(port);
     }
 
-    expect(new Set(pairs).size).toBe(64);
-  });
+    if (selected.length < targetCount) {
+      throw new Error(
+        `found only ${String(selected.length)} non-overlapping authority pairs from ${String(candidateLimit)} candidates`,
+      );
+    }
+
+    const starts = await Promise.all(
+      selected.map(async ({ paths, ports }) => {
+        try {
+          const host = await startHost({ paths, port: 0 });
+          runningHosts.push(host);
+          return { host, ports, type: "started" as const };
+        } catch (error) {
+          return { error, ports, type: "rejected" as const };
+        }
+      }),
+    );
+    expect(starts.filter((result) => result.type === "rejected")).toEqual([]);
+    await Promise.all(
+      starts.map(async (result) => {
+        if (result.type === "started")
+          expect(await readAuthorityPorts(result.host)).toEqual(result.ports);
+      }),
+    );
+  }, 15_000);
 
   test("allows exactly one of eight same-root authority contenders to start", async () => {
     const paths = await createPaths();
@@ -238,6 +280,17 @@ describe("Host network boundary", () => {
     let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     try {
       await waitForMessage("blocking");
+      const blockedAt = process.hrtime.bigint();
+      const minimumBlockedUntil = blockedAt + 5_500_000_000n;
+      while (process.hrtime.bigint() < minimumBlockedUntil) {
+        const remainingNanoseconds = minimumBlockedUntil - process.hrtime.bigint();
+        await new Promise<void>((resolveDelay) =>
+          setTimeout(resolveDelay, Number((remainingNanoseconds + 999_999n) / 1_000_000n)),
+        );
+      }
+      expect(process.hrtime.bigint() - blockedAt).toBeGreaterThanOrEqual(5_500_000_000n);
+      expect(messages.some((message) => message.type === "unblocked")).toBe(false);
+
       contender = startHost({ paths, port: 0 }).then(
         (host) => {
           contenderHost = host;
@@ -289,7 +342,7 @@ describe("Host network boundary", () => {
 
     expect(exit).toEqual({ code: null, signal: "SIGKILL" });
     expect(messages.some((message) => message.type === "unblocked")).toBe(false);
-  }, 12_000);
+  }, 15_000);
 
   test("fails closed when an unrelated process owns either derived authority port", async () => {
     const paths = await createPaths();
