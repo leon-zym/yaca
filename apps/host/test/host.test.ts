@@ -318,13 +318,12 @@ describe("Host network boundary", () => {
           runningHosts.push(host);
           try {
             await host.close();
-            return { type: "started" as const };
           } catch (error) {
             return { error, type: "cleanup_failed" as const };
-          } finally {
-            const contenderIndex = runningHosts.indexOf(host);
-            if (contenderIndex !== -1) runningHosts.splice(contenderIndex, 1);
           }
+          const contenderIndex = runningHosts.indexOf(host);
+          if (contenderIndex !== -1) runningHosts.splice(contenderIndex, 1);
+          return { type: "started" as const };
         },
         (error: unknown) => ({ error, type: "rejected" as const }),
       );
