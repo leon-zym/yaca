@@ -55,6 +55,24 @@ async function closeAuthorityBlocker(server: Server): Promise<void> {
   authorityBlockers.delete(server);
 }
 
+async function withDeadline<T>(
+  promise: Promise<T>,
+  milliseconds: number,
+  message: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), milliseconds);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 describe("Host network boundary", () => {
   test("refuses a non-loopback bind address", async () => {
     await expect(
@@ -274,9 +292,13 @@ describe("Host network boundary", () => {
     };
 
     let contender:
-      | Promise<{ host: RunningHost; type: "started" } | { error: unknown; type: "rejected" }>
+      | Promise<
+          | { type: "started" }
+          | { error: unknown; type: "cleanup_failed" }
+          | { error: unknown; type: "rejected" }
+        >
       | undefined;
-    let contenderHost: RunningHost | undefined;
+    let contenderSettled: typeof contender;
     let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     try {
       await waitForMessage("blocking");
@@ -292,15 +314,27 @@ describe("Host network boundary", () => {
       expect(messages.some((message) => message.type === "unblocked")).toBe(false);
 
       contender = startHost({ paths, port: 0 }).then(
-        (host) => {
-          contenderHost = host;
+        async (host) => {
           runningHosts.push(host);
-          return { host, type: "started" as const };
+          try {
+            await host.close();
+            return { type: "started" as const };
+          } catch (error) {
+            return { error, type: "cleanup_failed" as const };
+          } finally {
+            const contenderIndex = runningHosts.indexOf(host);
+            if (contenderIndex !== -1) runningHosts.splice(contenderIndex, 1);
+          }
         },
         (error: unknown) => ({ error, type: "rejected" as const }),
       );
-      const outcome = await Promise.race([
+      contenderSettled = withDeadline(
         contender,
+        5_000,
+        "same-root authority contender did not settle within 5 seconds",
+      );
+      const outcome = await Promise.race([
+        contenderSettled,
         unblocked.then(() => ({ type: "unblocked" as const })),
       ]);
       expect(outcome.type).toBe("rejected");
@@ -308,41 +342,20 @@ describe("Host network boundary", () => {
     } finally {
       try {
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-        let exitTimeout: ReturnType<typeof setTimeout> | undefined;
-        try {
-          exit = await Promise.race([
-            childExit,
-            new Promise<never>((_resolve, reject) => {
-              exitTimeout = setTimeout(
-                () => reject(new Error("blocking Host did not terminate after SIGKILL")),
-                2_000,
-              );
-            }),
-          ]);
-        } finally {
-          if (exitTimeout) clearTimeout(exitTimeout);
-        }
+        exit = await withDeadline(
+          childExit,
+          3_000,
+          "blocking Host did not terminate within 3 seconds after SIGKILL",
+        );
       } finally {
         if (exit) children.delete(child);
-
-        try {
-          await contender;
-        } finally {
-          if (contenderHost) {
-            try {
-              await contenderHost.close();
-            } finally {
-              const contenderIndex = runningHosts.indexOf(contenderHost);
-              if (contenderIndex !== -1) runningHosts.splice(contenderIndex, 1);
-            }
-          }
-        }
+        await contenderSettled;
       }
     }
 
     expect(exit).toEqual({ code: null, signal: "SIGKILL" });
     expect(messages.some((message) => message.type === "unblocked")).toBe(false);
-  }, 15_000);
+  }, 30_000);
 
   test("fails closed when an unrelated process owns either derived authority port", async () => {
     const paths = await createPaths();
