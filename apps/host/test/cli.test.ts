@@ -119,31 +119,11 @@ async function signalProcessTree(
   const wrapperExited = child.exitCode !== null || child.signalCode !== null;
   if (wrapperExited && !endpointKnownAlive) return;
   if (process.platform === "win32") {
-    const taskkill = spawn(
-      "taskkill",
-      ["/PID", String(child.pid), "/T", ...(signal === "SIGKILL" ? ["/F"] : [])],
-      { stdio: ["ignore", "ignore", "pipe"] },
-    );
-    let stderr = "";
-    taskkill.stderr.setEncoding("utf8").on("data", (chunk) => {
-      stderr += chunk;
-    });
-    const taskkillResult = await withDeadline(
-      new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit, reject) => {
-        taskkill.once("error", reject);
-        taskkill.once("close", (code, exitSignal) => resolveExit({ code, signal: exitSignal }));
-      }),
-      3_000,
-      `taskkill did not settle within 3 seconds for ${String(child.pid)}: ${stderr}`,
-    );
-    const exitedAfterTaskkill = child.exitCode !== null || child.signalCode !== null;
-    if (
-      (taskkillResult.code !== 0 || taskkillResult.signal !== null) &&
-      (!exitedAfterTaskkill || endpointKnownAlive)
-    ) {
-      throw new Error(
-        `taskkill failed for ${String(child.pid)} with code ${String(taskkillResult.code)}, signal ${String(taskkillResult.signal)}: ${stderr}`,
-      );
+    try {
+      await taskkillPid(child.pid, signal === "SIGKILL");
+    } catch (error) {
+      const exitedAfterTaskkill = child.exitCode !== null || child.signalCode !== null;
+      if (!exitedAfterTaskkill || endpointKnownAlive) throw error;
     }
     return;
   }
@@ -161,12 +141,139 @@ async function signalProcessTree(
   }
 }
 
+async function taskkillPid(pid: number, force: boolean): Promise<void> {
+  const taskkill = spawn("taskkill", ["/PID", String(pid), "/T", ...(force ? ["/F"] : [])], {
+    shell: false,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  taskkill.stderr.setEncoding("utf8").on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const taskkillExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolveExit, reject) => {
+      taskkill.once("error", reject);
+      taskkill.once("close", (code, signal) => resolveExit({ code, signal }));
+    },
+  );
+  let result: { code: number | null; signal: NodeJS.Signals | null };
+  try {
+    result = await withDeadline(
+      taskkillExit,
+      3_000,
+      `taskkill did not settle within 3 seconds for ${String(pid)}: ${stderr}`,
+    );
+  } catch (error) {
+    taskkill.kill("SIGKILL");
+    await withDeadline(
+      taskkillExit,
+      1_000,
+      `taskkill did not exit within 1 second after forced cleanup: ${String(pid)}`,
+    ).catch(() => undefined);
+    throw error;
+  }
+  if (result.code !== 0 || result.signal !== null) {
+    throw new Error(
+      `taskkill failed for ${String(pid)} with code ${String(result.code)}, signal ${String(result.signal)}: ${stderr}`,
+    );
+  }
+}
+
+function parseWindowsListeningPids(
+  output: string,
+  targetPorts: ReadonlySet<number>,
+  excludedPid: number,
+): number[] {
+  const pids = new Set<number>();
+  for (const line of output.split(/\r?\n/u)) {
+    const columns = line.trim().split(/\s+/u);
+    if (columns.length !== 5 || columns[0]?.toUpperCase() !== "TCP") continue;
+    if (columns[3]?.toUpperCase() !== "LISTENING") continue;
+    const portText = columns[1]?.match(/^127\.0\.0\.1:(\d+)$/u)?.[1];
+    const pidText = columns[4];
+    if (!portText || !pidText || !/^\d+$/u.test(pidText)) continue;
+    const port = Number(portText);
+    const pid = Number(pidText);
+    if (targetPorts.has(port) && Number.isSafeInteger(pid) && pid > 0 && pid !== excludedPid) {
+      pids.add(pid);
+    }
+  }
+  return [...pids].sort((left, right) => left - right);
+}
+
+async function findWindowsListenerPids(targetPorts: ReadonlySet<number>): Promise<number[]> {
+  const netstat = spawn("netstat", ["-ano", "-p", "TCP"], {
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  netstat.stdout.setEncoding("utf8").on("data", (chunk) => {
+    stdout += chunk;
+  });
+  netstat.stderr.setEncoding("utf8").on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const netstatExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolveExit, reject) => {
+      netstat.once("error", reject);
+      netstat.once("close", (code, signal) => resolveExit({ code, signal }));
+    },
+  );
+  let result: { code: number | null; signal: NodeJS.Signals | null };
+  try {
+    result = await withDeadline(
+      netstatExit,
+      5_000,
+      `netstat did not settle within 5 seconds: ${stderr}`,
+    );
+  } catch (error) {
+    netstat.kill("SIGKILL");
+    await withDeadline(
+      netstatExit,
+      1_000,
+      "netstat did not exit within 1 second after forced cleanup",
+    ).catch(() => undefined);
+    throw error;
+  }
+  if (result.code !== 0 || result.signal !== null) {
+    throw new Error(
+      `netstat failed with code ${String(result.code)}, signal ${String(result.signal)}: ${stderr}`,
+    );
+  }
+  return parseWindowsListeningPids(stdout, targetPorts, process.pid);
+}
+
+async function forceKillWindowsListeners(targetPorts: ReadonlySet<number>): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  let pids: number[] = [];
+  try {
+    pids = await findWindowsListenerPids(targetPorts);
+    if (pids.length === 0) {
+      errors.push(new Error("netstat found no owning PID for the live yaca listener ports"));
+    }
+  } catch (error) {
+    errors.push(error);
+  }
+  for (const pid of pids) {
+    try {
+      await taskkillPid(pid, true);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  return errors;
+}
+
 type TcpProbeResult = "closed" | "open" | "timeout";
 
-async function probeEndpoint(url: string, milliseconds: number): Promise<TcpProbeResult> {
-  const endpoint = new URL(url);
+async function probeEndpoint(
+  host: string,
+  port: number,
+  milliseconds: number,
+): Promise<TcpProbeResult> {
   return new Promise<TcpProbeResult>((resolveProbe, reject) => {
-    const socket = createConnection({ host: endpoint.hostname, port: Number(endpoint.port) });
+    const socket = createConnection({ host, port });
     let settled = false;
     const settle = (result: TcpProbeResult) => {
       if (settled) return;
@@ -190,11 +297,18 @@ async function probeEndpoint(url: string, milliseconds: number): Promise<TcpProb
   });
 }
 
-async function waitForEndpointUnreachable(url: string, milliseconds: number): Promise<boolean> {
+async function waitForPortsClosed(
+  host: string,
+  ports: readonly number[],
+  milliseconds: number,
+): Promise<boolean> {
   const deadline = Date.now() + milliseconds;
   while (Date.now() < deadline) {
-    const result = await probeEndpoint(url, Math.min(500, Math.max(1, deadline - Date.now())));
-    if (result === "closed") return true;
+    const probeMilliseconds = Math.min(500, Math.max(1, deadline - Date.now()));
+    const results = await Promise.all(
+      ports.map((port) => probeEndpoint(host, port, probeMilliseconds)),
+    );
+    if (results.every((result) => result === "closed")) return true;
     await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 100));
   }
   return false;
@@ -231,6 +345,23 @@ function runCli(
 }
 
 describe("yaca CLI", () => {
+  test("finds orphaned Windows listener PIDs after the wrapper is gone", () => {
+    const fixture = `
+      TCP    127.0.0.1:3210       0.0.0.0:0       LISTENING       4100
+      TCP    127.0.0.1:51234      0.0.0.0:0       LISTENING       4200
+      TCP    127.0.0.1:61234      0.0.0.0:0       LISTENING       4200
+      TCP    127.0.0.1:3210       0.0.0.0:0       LISTENING       ${String(process.pid)}
+      TCP    127.0.0.1:9999       0.0.0.0:0       LISTENING       4300
+      TCP    0.0.0.0:3210         0.0.0.0:0       LISTENING       4400
+      TCP    127.0.0.1:51234      0.0.0.0:0       LISTENING       not-a-pid
+      UDP    127.0.0.1:3210       *:*                             4500
+    `;
+
+    expect(
+      parseWindowsListeningPids(fixture, new Set([3_210, 51_234, 61_234]), process.pid),
+    ).toEqual([4_100, 4_200]);
+  });
+
   test("prints help and version without starting the Host", async () => {
     const help = await runCli("--help");
     const version = await runCli("--version");
@@ -327,6 +458,7 @@ describe("yaca CLI", () => {
     child.stderr.on("data", capture);
 
     let url: string | undefined;
+    let authorityPorts: [number, number] | undefined;
     let testError: unknown;
     const cleanupErrors: unknown[] = [];
     try {
@@ -348,9 +480,14 @@ describe("yaca CLI", () => {
         `development CLI did not start within 15 seconds: ${output}`,
       );
 
-      const health = await fetch(`${url}/api/health`, {
+      const health = (await fetch(`${url}/api/health`, {
         signal: AbortSignal.timeout(5_000),
-      }).then((response) => response.json());
+      }).then((response) => response.json())) as {
+        authorityPorts: [number, number];
+        status: string;
+        version: string;
+      };
+      authorityPorts = health.authorityPorts;
       expect(health).toMatchObject({ status: "ok", version: "0.0.0-dev" });
       expect(output).not.toMatch(/Corepack is about to download|Do you want to continue/i);
       expect(output).not.toContain("registry.npmjs.org/pnpm");
@@ -389,10 +526,18 @@ describe("yaca CLI", () => {
       if (wrapperExited) children.delete(child);
 
       const observedUrl = url ?? output.match(/yaca listening at (http:\/\/127\.0\.0\.1:\d+)/)?.[1];
+      const observedEndpoint = observedUrl ? new URL(observedUrl) : undefined;
+      const appPort = observedEndpoint ? Number(observedEndpoint.port) : undefined;
+      const targetPorts =
+        appPort === undefined
+          ? []
+          : process.platform === "win32" && authorityPorts
+            ? [appPort, ...authorityPorts]
+            : [appPort];
       let endpointDown = observedUrl === undefined;
-      if (observedUrl) {
+      if (observedEndpoint && targetPorts.length > 0) {
         try {
-          endpointDown = await waitForEndpointUnreachable(observedUrl, 3_000);
+          endpointDown = await waitForPortsClosed(observedEndpoint.hostname, targetPorts, 3_000);
         } catch (error) {
           cleanupErrors.push(
             new Error(`could not prove the development Host endpoint closed: ${observedUrl}`, {
@@ -403,14 +548,29 @@ describe("yaca CLI", () => {
       }
       if (observedUrl && !endpointDown) {
         cleanupErrors.push(new Error(`development Host endpoint did not close: ${observedUrl}`));
-        try {
-          await signalProcessTree(child, "SIGKILL", true);
-        } catch (error) {
-          cleanupErrors.push(error);
+        if (process.platform === "win32") {
+          if (!wrapperExited) {
+            try {
+              await signalProcessTree(child, "SIGKILL", true);
+            } catch (error) {
+              cleanupErrors.push(error);
+            }
+          }
+          cleanupErrors.push(...(await forceKillWindowsListeners(new Set(targetPorts))));
+        } else {
+          try {
+            await signalProcessTree(child, "SIGKILL", true);
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
         }
         let downAfterForce = false;
         try {
-          downAfterForce = await waitForEndpointUnreachable(observedUrl, 3_000);
+          downAfterForce = await waitForPortsClosed(
+            observedEndpoint?.hostname ?? "127.0.0.1",
+            targetPorts,
+            3_000,
+          );
         } catch (error) {
           cleanupErrors.push(
             new Error(
@@ -434,7 +594,7 @@ describe("yaca CLI", () => {
     const errors = [...(testError ? [testError] : []), ...cleanupErrors];
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) throw new AggregateError(errors, "development CLI smoke failed");
-  }, 35_000);
+  }, 60_000);
 
   test("restarts immediately after SIGKILL releases the kernel authority fence", async () => {
     const temporary = await mkdtemp(join(tmpdir(), "yaca-crash-cli-"));
