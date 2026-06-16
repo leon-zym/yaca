@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { cp, mkdtemp, mkdir, readdir, rm, truncate, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
 const hostRoot = resolve(import.meta.dirname, "..");
@@ -11,12 +11,14 @@ const repositoryRoot = resolve(hostRoot, "../..");
 const cliPath = join(hostRoot, "dist", "cli.js");
 const temporaryRoots: string[] = [];
 const children = new Set<ReturnType<typeof spawn>>();
+const packageManager = (
+  JSON.parse(readFileSync(join(repositoryRoot, "package.json"), "utf8")) as {
+    packageManager: string;
+  }
+).packageManager;
+const expectedPnpmMajor = packageManager.match(/^pnpm@(\d+)\./u)?.[1];
 
-function isDirectPnpmCli(path: string): boolean {
-  return /^pnpm\.[cm]?js$/u.test(basename(path)) && !path.toLowerCase().includes("corepack");
-}
-
-function resolvePnpmCli(): string {
+async function resolvePnpmCli(home: string): Promise<string> {
   const npmExecPath = process.env.npm_execpath;
   if (!npmExecPath) {
     throw new Error("pnpm did not provide npm_execpath; run the test through pnpm");
@@ -28,8 +30,64 @@ function resolvePnpmCli(): string {
   } catch (error) {
     throw new Error("pnpm npm_execpath could not be resolved", { cause: error });
   }
-  if (!isDirectPnpmCli(resolved)) {
-    throw new Error(`pnpm npm_execpath is not a direct non-Corepack JavaScript CLI: ${resolved}`);
+  if (!statSync(resolved).isFile()) {
+    throw new Error(`pnpm npm_execpath is not a regular file: ${resolved}`);
+  }
+  if (!expectedPnpmMajor) {
+    throw new Error(`root packageManager is not a pinned pnpm version: ${packageManager}`);
+  }
+
+  const versionChild = spawn(process.execPath, [resolved, "--version"], {
+    env: {
+      ...process.env,
+      CI: "1",
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+      HOME: home,
+      NO_COLOR: "1",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  versionChild.stdout.setEncoding("utf8").on("data", (chunk) => {
+    stdout += chunk;
+  });
+  versionChild.stderr.setEncoding("utf8").on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const versionExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+    (resolveExit, reject) => {
+      versionChild.once("error", reject);
+      versionChild.once("close", (code, signal) => resolveExit({ code, signal }));
+    },
+  );
+  let result: { code: number | null; signal: NodeJS.Signals | null };
+  try {
+    result = await withDeadline(
+      versionExit,
+      5_000,
+      `pnpm npm_execpath did not report a version within 5 seconds: ${stderr}`,
+    );
+  } catch (error) {
+    versionChild.kill("SIGKILL");
+    await versionExit.catch(() => undefined);
+    throw error;
+  }
+  const versionOutput = `${stdout}${stderr}`;
+  if (result.code !== 0 || result.signal !== null) {
+    throw new Error(`pnpm npm_execpath --version failed: ${versionOutput}`);
+  }
+  if (stdout.trim().match(/^(\d+)\./u)?.[1] !== expectedPnpmMajor) {
+    throw new Error(
+      `pnpm npm_execpath major does not match ${packageManager}: ${stdout.trim() || stderr.trim()}`,
+    );
+  }
+  if (
+    /Corepack is about to download|Do you want to continue|registry\.npmjs\.org\/pnpm/iu.test(
+      versionOutput,
+    )
+  ) {
+    throw new Error(`pnpm npm_execpath attempted an interactive download: ${versionOutput}`);
   }
   return resolved;
 }
@@ -55,41 +113,88 @@ async function withDeadline<T>(
 async function signalProcessTree(
   child: ReturnType<typeof spawn>,
   signal: "SIGKILL" | "SIGTERM",
+  endpointKnownAlive = false,
 ): Promise<void> {
   if (child.pid === undefined) return;
+  const wrapperExited = child.exitCode !== null || child.signalCode !== null;
+  if (wrapperExited && !endpointKnownAlive) return;
   if (process.platform === "win32") {
     const taskkill = spawn(
       "taskkill",
       ["/PID", String(child.pid), "/T", ...(signal === "SIGKILL" ? ["/F"] : [])],
-      { stdio: "ignore" },
+      { stdio: ["ignore", "ignore", "pipe"] },
     );
-    await withDeadline(
-      new Promise<void>((resolveExit, reject) => {
+    let stderr = "";
+    taskkill.stderr.setEncoding("utf8").on("data", (chunk) => {
+      stderr += chunk;
+    });
+    const taskkillResult = await withDeadline(
+      new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit, reject) => {
         taskkill.once("error", reject);
-        taskkill.once("exit", () => resolveExit());
+        taskkill.once("close", (code, exitSignal) => resolveExit({ code, signal: exitSignal }));
       }),
       3_000,
-      `taskkill did not settle within 3 seconds for ${String(child.pid)}`,
+      `taskkill did not settle within 3 seconds for ${String(child.pid)}: ${stderr}`,
     );
+    const exitedAfterTaskkill = child.exitCode !== null || child.signalCode !== null;
+    if (
+      (taskkillResult.code !== 0 || taskkillResult.signal !== null) &&
+      (!exitedAfterTaskkill || endpointKnownAlive)
+    ) {
+      throw new Error(
+        `taskkill failed for ${String(child.pid)} with code ${String(taskkillResult.code)}, signal ${String(taskkillResult.signal)}: ${stderr}`,
+      );
+    }
     return;
   }
 
   try {
     process.kill(-child.pid, signal);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    if (
+      (error as NodeJS.ErrnoException).code !== "ESRCH" ||
+      !(child.exitCode !== null || child.signalCode !== null) ||
+      endpointKnownAlive
+    ) {
+      throw error;
+    }
   }
+}
+
+type TcpProbeResult = "closed" | "open" | "timeout";
+
+async function probeEndpoint(url: string, milliseconds: number): Promise<TcpProbeResult> {
+  const endpoint = new URL(url);
+  return new Promise<TcpProbeResult>((resolveProbe, reject) => {
+    const socket = createConnection({ host: endpoint.hostname, port: Number(endpoint.port) });
+    let settled = false;
+    const settle = (result: TcpProbeResult) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolveProbe(result);
+    };
+    socket.setTimeout(milliseconds, () => settle("timeout"));
+    socket.once("connect", () => settle("open"));
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ECONNREFUSED") settle("closed");
+      else {
+        settled = true;
+        socket.destroy();
+        reject(error);
+      }
+    });
+    socket.once("close", () => {
+      if (!settled) settle("closed");
+    });
+  });
 }
 
 async function waitForEndpointUnreachable(url: string, milliseconds: number): Promise<boolean> {
   const deadline = Date.now() + milliseconds;
   while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${url}/api/health`, { signal: AbortSignal.timeout(500) });
-      await response.body?.cancel();
-    } catch {
-      return true;
-    }
+    const result = await probeEndpoint(url, Math.min(500, Math.max(1, deadline - Date.now())));
+    if (result === "closed") return true;
     await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 100));
   }
   return false;
@@ -195,7 +300,7 @@ describe("yaca CLI", () => {
     const home = join(temporary, "home");
     await mkdir(home);
 
-    const pnpmCli = resolvePnpmCli();
+    const pnpmCli = await resolvePnpmCli(home);
     const child = spawn(process.execPath, [pnpmCli, "dev", "--port", "0"], {
       cwd: repositoryRoot,
       detached: process.platform !== "win32",
@@ -284,16 +389,39 @@ describe("yaca CLI", () => {
       if (wrapperExited) children.delete(child);
 
       const observedUrl = url ?? output.match(/yaca listening at (http:\/\/127\.0\.0\.1:\d+)/)?.[1];
-      if (observedUrl && !(await waitForEndpointUnreachable(observedUrl, 3_000))) {
-        cleanupErrors.push(
-          new Error(`orphaned development Host remained reachable at ${observedUrl}`),
-        );
+      let endpointDown = observedUrl === undefined;
+      if (observedUrl) {
         try {
-          await signalProcessTree(child, "SIGKILL");
+          endpointDown = await waitForEndpointUnreachable(observedUrl, 3_000);
+        } catch (error) {
+          cleanupErrors.push(
+            new Error(`could not prove the development Host endpoint closed: ${observedUrl}`, {
+              cause: error,
+            }),
+          );
+        }
+      }
+      if (observedUrl && !endpointDown) {
+        cleanupErrors.push(new Error(`development Host endpoint did not close: ${observedUrl}`));
+        try {
+          await signalProcessTree(child, "SIGKILL", true);
         } catch (error) {
           cleanupErrors.push(error);
         }
-        if (!(await waitForEndpointUnreachable(observedUrl, 3_000))) {
+        let downAfterForce = false;
+        try {
+          downAfterForce = await waitForEndpointUnreachable(observedUrl, 3_000);
+        } catch (error) {
+          cleanupErrors.push(
+            new Error(
+              `could not prove the endpoint closed after a second tree kill: ${observedUrl}`,
+              {
+                cause: error,
+              },
+            ),
+          );
+        }
+        if (!downAfterForce) {
           cleanupErrors.push(
             new Error(
               `development Host remained reachable after a second tree kill: ${observedUrl}`,
