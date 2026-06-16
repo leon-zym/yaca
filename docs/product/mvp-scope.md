@@ -6,6 +6,8 @@ yaca is a desktop-first, local, single-user AI coding agent. Running `yaca` open
 
 The browser never contacts a model Provider or executes tools. The Host is the only authority, and every yaca-owned persistent file lives under `~/.yaca/`.
 
+The Foundation and MVP acceptance target is macOS and Linux. Windows build, typecheck, and package smoke are best-effort; Windows hardware and the development process-tree smoke are not release claims for this MVP.
+
 ## Required vertical path
 
 The release path is complete only when a user can:
@@ -61,6 +63,7 @@ The release path is complete only when a user can:
 
 ### Resilience
 
+- Admit only one Host for a canonical data root by holding a deterministic two-socket loopback authority fence for the complete application lifetime. Any partial bind, port conflict, or later startup failure rolls back and fails closed; no PID or file lease is authoritative.
 - Reconcile global realtime state with a bounded `app.sync` Host snapshot and an atomic event-sequence watermark after refresh, gap, epoch mismatch, overflow, or connection loss. Session sync remains a navigation read.
 - Record every mutation with Host, Workspace, Session, or Run scope before its local or runtime side effect.
 - Return an existing Command Receipt for a duplicate mutation identifier.

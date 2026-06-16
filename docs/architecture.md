@@ -128,10 +128,15 @@ Every yaca-owned persistent file is below `~/.yaca/`:
   content/     content-addressed complete tool output
   trash/       recoverably removed Sessions and restore metadata
   logs/        redacted operational logs
-  run/         process lock and runtime metadata
 ```
 
 The CLI establishes these paths before dynamically loading Host modules that import the SDK, and the Host also passes explicit paths wherever the public SDK accepts them. The capability gate verifies actual writes.
+
+Single-Host ownership is not a persistent fact. yaca writes no PID file, lease, `host.lock`, or diagnostic ownership metadata. Instead, it derives a stable pair of authority ports from the canonical data-root path: two independent 32-bit segments of its SHA-256 digest map into the loopback dynamic/private range `49152–65535`; if both map to the same port, the second advances by one with range wrap. The non-sensitive pair may appear in health diagnostics, but only the bound kernel sockets carry authority.
+
+Before application initialization or HTTP listen, the Host exclusively binds both authority ports on `127.0.0.1`. It owns the data root only after both binds succeed. A conflict on either port fails closed; failure of the second bind releases the first before startup returns. Any later startup failure also releases the full fence. Process exit, crash, and `SIGKILL` let the OS release the sockets without stale-owner recovery.
+
+The deterministic finite port range admits conservative false conflicts. Two different canonical roots that share either derived port cannot run together, and an unrelated local listener on either port also prevents startup. yaca accepts that availability cost rather than risk two Hosts mutating one data root; changing the root changes the derived pair. The choice and rejected PID/file-lease alternatives are recorded in [ADR-0004](adr/0004-use-loopback-sockets-for-single-host-authority.md).
 
 Authority is divided by fact, not duplicated:
 
@@ -276,12 +281,14 @@ These controls protect the loopback control plane from drive-by browser access. 
 
 `yaca` is both the product name and primary executable. The CLI:
 
-1. resolves and validates `~/.yaca/` paths;
-2. acquires a single-Host process lock;
-3. initializes redacted logging;
+1. resolves and validates the canonical `~/.yaca/` data root, rejecting a root-leaf symlink or any derived path that escapes it;
+2. derives the two authority ports and binds both loopback sockets, rolling back a partial bind;
+3. initializes redacted logging and the application only after the complete authority fence is held;
 4. starts the same-origin Host on loopback;
 5. opens the authenticated fragment URL unless explicitly disabled; and
-6. drains the active operation, settings writes, Command Ledger, and logs on shutdown within a bounded deadline.
+6. drains active work and durable writes, gives application connections a two-second grace period, force-closes remaining connections, and releases the authority sockets last in reverse acquisition order.
+
+Application shutdown is bounded before fence release so a contender cannot start while the previous Host can still serve or mutate. The same release path covers initialization failure. The Foundation and MVP acceptance environments are macOS and Linux; Windows build, typecheck, and package smoke remain best-effort rather than a Windows hardware support claim.
 
 The production Host serves the compiled Web assets. No Electron shell, database server, container runtime, or external CLI is required.
 
@@ -315,6 +322,8 @@ The module interface is the test surface.
 ### Recovery and browser paths
 
 - Host integration tests reopen Sessions and reconcile active/committed state.
+- Process-lifecycle tests derive stable pairs for the same canonical root, exercise disjoint roots concurrently, reject any shared or externally occupied port, prove partial-bind and post-bind startup rollback, and verify the fence remains exclusive while the Host event loop is paused.
+- Crash and shutdown tests cover OS release after `SIGKILL`, immediate restart on the same stable pair, application connection drain followed by forced close at the two-second bound, and authority release only after application close.
 - Playwright covers refresh, full app sync after WebSocket loss, Host kill/restart unknown classifications, read-only inspection of another Session, exact-run Stop, next-Run settings, theme persistence, active-session trash fallback/rollback, trash restore, long content, and the real file-edit path.
 - Preference tests cover bootstrap, update, broadcast, atomic persistence, invalid values, and restart for all three theme preferences.
 - Workspace tests cover missing paths, non-directories, permission failures, symlink/canonical duplicates, display-name update, and removal without deletion.
