@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { cp, mkdtemp, mkdir, readdir, rm, truncate, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, delimiter, join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 
 const hostRoot = resolve(import.meta.dirname, "..");
@@ -10,6 +11,54 @@ const repositoryRoot = resolve(hostRoot, "../..");
 const cliPath = join(hostRoot, "dist", "cli.js");
 const temporaryRoots: string[] = [];
 const children = new Set<ReturnType<typeof spawn>>();
+
+function isDirectPnpmCli(path: string): boolean {
+  return /^pnpm\.[cm]?js$/u.test(basename(path)) && !path.toLowerCase().includes("corepack");
+}
+
+function resolvePnpmCli(): string {
+  const npmExecPath = process.env.npm_execpath;
+  if (npmExecPath) {
+    try {
+      const resolved = realpathSync(npmExecPath);
+      if (isDirectPnpmCli(resolved)) return resolved;
+    } catch {
+      // Fall through to a pre-resolved PATH CLI without invoking a package-manager shim.
+    }
+  }
+
+  for (const directory of (process.env.PATH ?? "").split(delimiter)) {
+    if (!directory) continue;
+    try {
+      const resolved = realpathSync(join(directory, "pnpm"));
+      if (isDirectPnpmCli(resolved)) return resolved;
+    } catch {
+      // Continue to the next PATH entry; fallback must resolve a direct CLI, never a shim prompt.
+    }
+  }
+
+  throw new Error(
+    "unable to resolve a direct pnpm JavaScript CLI; run the test through an installed pnpm CLI",
+  );
+}
+
+async function withDeadline<T>(
+  promise: Promise<T>,
+  milliseconds: number,
+  message: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), milliseconds);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
 
 afterEach(async () => {
   for (const child of children) child.kill("SIGTERM");
@@ -111,43 +160,81 @@ describe("yaca CLI", () => {
     const home = join(temporary, "home");
     await mkdir(home);
 
-    const child = spawn("pnpm", ["dev", "--port", "0"], {
+    const pnpmCli = resolvePnpmCli();
+    const child = spawn(process.execPath, [pnpmCli, "dev", "--port", "0"], {
       cwd: repositoryRoot,
-      env: { ...process.env, HOME: home, NO_COLOR: "1" },
+      env: {
+        ...process.env,
+        CI: "1",
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+        HOME: home,
+        NO_COLOR: "1",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     children.add(child);
+    const childExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })),
+    );
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
+    let output = "";
+    const capture = (chunk: string) => {
+      output += chunk;
+    };
+    child.stdout.on("data", capture);
+    child.stderr.on("data", capture);
 
-    const url = await new Promise<string>((resolveUrl, reject) => {
-      let output = "";
-      const timeout = setTimeout(
-        () => reject(new Error(`development CLI did not start: ${output}`)),
-        10_000,
+    let testError: unknown;
+    let shutdownError: unknown;
+    try {
+      const started = new Promise<string>((resolveUrl, reject) => {
+        const inspect = () => {
+          const match = output.match(/yaca listening at (http:\/\/127\.0\.0\.1:\d+)/);
+          if (match?.[1]) resolveUrl(match[1]);
+        };
+        child.stdout.on("data", inspect);
+        child.stderr.on("data", inspect);
+        child.on("error", reject);
+        child.on("exit", (code) =>
+          reject(new Error(`development CLI exited early with ${String(code)}: ${output}`)),
+        );
+      });
+      const url = await withDeadline(
+        started,
+        15_000,
+        `development CLI did not start within 15 seconds: ${output}`,
       );
-      const capture = (chunk: string) => {
-        output += chunk;
-        const match = output.match(/yaca listening at (http:\/\/127\.0\.0\.1:\d+)/);
-        if (match?.[1]) {
-          clearTimeout(timeout);
-          resolveUrl(match[1]);
-        }
-      };
-      child.stdout.on("data", capture);
-      child.stderr.on("data", capture);
-      child.on("exit", (code) =>
-        reject(new Error(`development CLI exited early with ${String(code)}: ${output}`)),
-      );
-    });
 
-    const health = await fetch(`${url}/api/health`).then((response) => response.json());
-    expect(health).toMatchObject({ status: "ok", version: "0.0.0-dev" });
+      const health = await fetch(`${url}/api/health`).then((response) => response.json());
+      expect(health).toMatchObject({ status: "ok", version: "0.0.0-dev" });
+      expect(output).not.toMatch(/Corepack is about to download|Do you want to continue/i);
+      expect(output).not.toContain("registry.npmjs.org/pnpm");
+    } catch (error) {
+      testError = error;
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      try {
+        await withDeadline(
+          childExit,
+          3_000,
+          "development CLI did not exit within 3 seconds after SIGTERM",
+        );
+      } catch (error) {
+        shutdownError = error;
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        await withDeadline(
+          childExit,
+          3_000,
+          "development CLI did not exit within 3 seconds after SIGKILL",
+        );
+      }
+      children.delete(child);
+    }
 
-    child.kill("SIGTERM");
-    await new Promise((resolveExit) => child.once("exit", resolveExit));
-    children.delete(child);
-  });
+    if (testError) throw testError;
+    if (shutdownError) throw shutdownError;
+  }, 25_000);
 
   test("restarts immediately after SIGKILL releases the kernel authority fence", async () => {
     const temporary = await mkdtemp(join(tmpdir(), "yaca-crash-cli-"));
