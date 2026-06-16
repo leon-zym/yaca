@@ -15,6 +15,10 @@ contains no demo data or placeholder controls.
 - Node.js 22.19 or newer
 - Corepack
 
+The current Foundation and MVP acceptance target is macOS and Linux. Windows build, typecheck, and
+package smoke coverage is best-effort; the root `pnpm dev` process-tree smoke is POSIX-only and has
+not been validated on Windows hardware.
+
 The workspace pins pnpm in `package.json`; use Corepack rather than a separately installed pnpm.
 
 ## Install and build
@@ -102,8 +106,8 @@ Tests use temporary filesystems and real loopback HTTP. They cover canonical run
 preparation, root-leaf and derived-path symlink rejection, owner-only root creation, the kernel
 authority fence (including SIGKILL recovery, event-loop blocking, unrelated port ownership, and
 concurrent contenders), bounded connection shutdown, non-loopback rejection, the health schema,
-production and development CLI startup, and Web static fallback. The pack smoke builds a tarball,
-installs it into a fresh temporary consumer, and starts the installed `yaca` binary.
+production and POSIX development CLI startup, and Web static fallback. The pack smoke builds a
+tarball, installs it into a fresh temporary consumer, and starts the installed `yaca` binary.
 
 ## Security boundary
 

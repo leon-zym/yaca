@@ -118,15 +118,6 @@ async function signalProcessTree(
   if (child.pid === undefined) return;
   const wrapperExited = child.exitCode !== null || child.signalCode !== null;
   if (wrapperExited && !endpointKnownAlive) return;
-  if (process.platform === "win32") {
-    try {
-      await taskkillPid(child.pid, signal === "SIGKILL");
-    } catch (error) {
-      const exitedAfterTaskkill = child.exitCode !== null || child.signalCode !== null;
-      if (!exitedAfterTaskkill || endpointKnownAlive) throw error;
-    }
-    return;
-  }
 
   try {
     process.kill(-child.pid, signal);
@@ -139,130 +130,6 @@ async function signalProcessTree(
       throw error;
     }
   }
-}
-
-async function taskkillPid(pid: number, force: boolean): Promise<void> {
-  const taskkill = spawn("taskkill", ["/PID", String(pid), "/T", ...(force ? ["/F"] : [])], {
-    shell: false,
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  let stderr = "";
-  taskkill.stderr.setEncoding("utf8").on("data", (chunk) => {
-    stderr += chunk;
-  });
-  const taskkillExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-    (resolveExit, reject) => {
-      taskkill.once("error", reject);
-      taskkill.once("close", (code, signal) => resolveExit({ code, signal }));
-    },
-  );
-  let result: { code: number | null; signal: NodeJS.Signals | null };
-  try {
-    result = await withDeadline(
-      taskkillExit,
-      3_000,
-      `taskkill did not settle within 3 seconds for ${String(pid)}: ${stderr}`,
-    );
-  } catch (error) {
-    taskkill.kill("SIGKILL");
-    await withDeadline(
-      taskkillExit,
-      1_000,
-      `taskkill did not exit within 1 second after forced cleanup: ${String(pid)}`,
-    ).catch(() => undefined);
-    throw error;
-  }
-  if (result.code !== 0 || result.signal !== null) {
-    throw new Error(
-      `taskkill failed for ${String(pid)} with code ${String(result.code)}, signal ${String(result.signal)}: ${stderr}`,
-    );
-  }
-}
-
-function parseWindowsListeningPids(
-  output: string,
-  targetPorts: ReadonlySet<number>,
-  excludedPid: number,
-): number[] {
-  const pids = new Set<number>();
-  for (const line of output.split(/\r?\n/u)) {
-    const columns = line.trim().split(/\s+/u);
-    if (columns.length !== 5 || columns[0]?.toUpperCase() !== "TCP") continue;
-    if (columns[3]?.toUpperCase() !== "LISTENING") continue;
-    const portText = columns[1]?.match(/^127\.0\.0\.1:(\d+)$/u)?.[1];
-    const pidText = columns[4];
-    if (!portText || !pidText || !/^\d+$/u.test(pidText)) continue;
-    const port = Number(portText);
-    const pid = Number(pidText);
-    if (targetPorts.has(port) && Number.isSafeInteger(pid) && pid > 0 && pid !== excludedPid) {
-      pids.add(pid);
-    }
-  }
-  return [...pids].sort((left, right) => left - right);
-}
-
-async function findWindowsListenerPids(targetPorts: ReadonlySet<number>): Promise<number[]> {
-  const netstat = spawn("netstat", ["-ano", "-p", "TCP"], {
-    shell: false,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdout = "";
-  let stderr = "";
-  netstat.stdout.setEncoding("utf8").on("data", (chunk) => {
-    stdout += chunk;
-  });
-  netstat.stderr.setEncoding("utf8").on("data", (chunk) => {
-    stderr += chunk;
-  });
-  const netstatExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-    (resolveExit, reject) => {
-      netstat.once("error", reject);
-      netstat.once("close", (code, signal) => resolveExit({ code, signal }));
-    },
-  );
-  let result: { code: number | null; signal: NodeJS.Signals | null };
-  try {
-    result = await withDeadline(
-      netstatExit,
-      5_000,
-      `netstat did not settle within 5 seconds: ${stderr}`,
-    );
-  } catch (error) {
-    netstat.kill("SIGKILL");
-    await withDeadline(
-      netstatExit,
-      1_000,
-      "netstat did not exit within 1 second after forced cleanup",
-    ).catch(() => undefined);
-    throw error;
-  }
-  if (result.code !== 0 || result.signal !== null) {
-    throw new Error(
-      `netstat failed with code ${String(result.code)}, signal ${String(result.signal)}: ${stderr}`,
-    );
-  }
-  return parseWindowsListeningPids(stdout, targetPorts, process.pid);
-}
-
-async function forceKillWindowsListeners(targetPorts: ReadonlySet<number>): Promise<unknown[]> {
-  const errors: unknown[] = [];
-  let pids: number[] = [];
-  try {
-    pids = await findWindowsListenerPids(targetPorts);
-    if (pids.length === 0) {
-      errors.push(new Error("netstat found no owning PID for the live yaca listener ports"));
-    }
-  } catch (error) {
-    errors.push(error);
-  }
-  for (const pid of pids) {
-    try {
-      await taskkillPid(pid, true);
-    } catch (error) {
-      errors.push(error);
-    }
-  }
-  return errors;
 }
 
 type TcpProbeResult = "closed" | "open" | "timeout";
@@ -345,23 +212,6 @@ function runCli(
 }
 
 describe("yaca CLI", () => {
-  test("finds orphaned Windows listener PIDs after the wrapper is gone", () => {
-    const fixture = `
-      TCP    127.0.0.1:3210       0.0.0.0:0       LISTENING       4100
-      TCP    127.0.0.1:51234      0.0.0.0:0       LISTENING       4200
-      TCP    127.0.0.1:61234      0.0.0.0:0       LISTENING       4200
-      TCP    127.0.0.1:3210       0.0.0.0:0       LISTENING       ${String(process.pid)}
-      TCP    127.0.0.1:9999       0.0.0.0:0       LISTENING       4300
-      TCP    0.0.0.0:3210         0.0.0.0:0       LISTENING       4400
-      TCP    127.0.0.1:51234      0.0.0.0:0       LISTENING       not-a-pid
-      UDP    127.0.0.1:3210       *:*                             4500
-    `;
-
-    expect(
-      parseWindowsListeningPids(fixture, new Set([3_210, 51_234, 61_234]), process.pid),
-    ).toEqual([4_100, 4_200]);
-  });
-
   test("prints help and version without starting the Host", async () => {
     const help = await runCli("--help");
     const version = await runCli("--version");
@@ -425,176 +275,159 @@ describe("yaca CLI", () => {
     await expect(readdir(ignoredYacaHome)).rejects.toThrow();
   });
 
-  test("starts from the root development command with an explicit development version", async () => {
-    const temporary = await mkdtemp(join(tmpdir(), "yaca-dev-cli-"));
-    temporaryRoots.push(temporary);
-    const home = join(temporary, "home");
-    await mkdir(home);
+  test.skipIf(process.platform === "win32")(
+    "starts from the root development command with an explicit development version",
+    async () => {
+      const temporary = await mkdtemp(join(tmpdir(), "yaca-dev-cli-"));
+      temporaryRoots.push(temporary);
+      const home = join(temporary, "home");
+      await mkdir(home);
 
-    const pnpmCli = await resolvePnpmCli(home);
-    const child = spawn(process.execPath, [pnpmCli, "dev", "--port", "0"], {
-      cwd: repositoryRoot,
-      detached: process.platform !== "win32",
-      env: {
-        ...process.env,
-        CI: "1",
-        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
-        HOME: home,
-        NO_COLOR: "1",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    children.add(child);
-    const childExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-      (resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })),
-    );
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    let output = "";
-    const capture = (chunk: string) => {
-      output += chunk;
-    };
-    child.stdout.on("data", capture);
-    child.stderr.on("data", capture);
-
-    let url: string | undefined;
-    let authorityPorts: [number, number] | undefined;
-    let testError: unknown;
-    const cleanupErrors: unknown[] = [];
-    try {
-      const started = new Promise<string>((resolveUrl, reject) => {
-        const inspect = () => {
-          const match = output.match(/yaca listening at (http:\/\/127\.0\.0\.1:\d+)/);
-          if (match?.[1]) resolveUrl(match[1]);
-        };
-        child.stdout.on("data", inspect);
-        child.stderr.on("data", inspect);
-        child.on("error", reject);
-        child.on("exit", (code) =>
-          reject(new Error(`development CLI exited early with ${String(code)}: ${output}`)),
-        );
+      const pnpmCli = await resolvePnpmCli(home);
+      const child = spawn(process.execPath, [pnpmCli, "dev", "--port", "0"], {
+        cwd: repositoryRoot,
+        detached: true,
+        env: {
+          ...process.env,
+          CI: "1",
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+          HOME: home,
+          NO_COLOR: "1",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
       });
-      url = await withDeadline(
-        started,
-        15_000,
-        `development CLI did not start within 15 seconds: ${output}`,
+      children.add(child);
+      const childExit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+        (resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })),
       );
-
-      const health = (await fetch(`${url}/api/health`, {
-        signal: AbortSignal.timeout(5_000),
-      }).then((response) => response.json())) as {
-        authorityPorts: [number, number];
-        status: string;
-        version: string;
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      let output = "";
+      const capture = (chunk: string) => {
+        output += chunk;
       };
-      authorityPorts = health.authorityPorts;
-      expect(health).toMatchObject({ status: "ok", version: "0.0.0-dev" });
-      expect(output).not.toMatch(/Corepack is about to download|Do you want to continue/i);
-      expect(output).not.toContain("registry.npmjs.org/pnpm");
-    } catch (error) {
-      testError = error;
-    } finally {
+      child.stdout.on("data", capture);
+      child.stderr.on("data", capture);
+
+      let url: string | undefined;
+      let testError: unknown;
+      const cleanupErrors: unknown[] = [];
       try {
-        await signalProcessTree(child, "SIGTERM");
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
-      let wrapperExited = false;
-      try {
-        await withDeadline(
-          childExit,
-          3_000,
-          "development CLI wrapper did not exit within 3 seconds after tree SIGTERM",
+        const started = new Promise<string>((resolveUrl, reject) => {
+          const inspect = () => {
+            const match = output.match(/yaca listening at (http:\/\/127\.0\.0\.1:\d+)/);
+            if (match?.[1]) resolveUrl(match[1]);
+          };
+          child.stdout.on("data", inspect);
+          child.stderr.on("data", inspect);
+          child.on("error", reject);
+          child.on("exit", (code) =>
+            reject(new Error(`development CLI exited early with ${String(code)}: ${output}`)),
+          );
+        });
+        url = await withDeadline(
+          started,
+          15_000,
+          `development CLI did not start within 15 seconds: ${output}`,
         );
-        wrapperExited = true;
+
+        const health = await fetch(`${url}/api/health`, {
+          signal: AbortSignal.timeout(5_000),
+        }).then((response) => response.json());
+        expect(health).toMatchObject({ status: "ok", version: "0.0.0-dev" });
+        expect(output).not.toMatch(/Corepack is about to download|Do you want to continue/i);
+        expect(output).not.toContain("registry.npmjs.org/pnpm");
       } catch (error) {
-        cleanupErrors.push(error);
-      }
-      if (!wrapperExited) {
+        testError = error;
+      } finally {
         try {
-          await signalProcessTree(child, "SIGKILL");
+          await signalProcessTree(child, "SIGTERM");
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+        let wrapperExited = false;
+        try {
           await withDeadline(
             childExit,
             3_000,
-            "development CLI wrapper did not exit within 3 seconds after tree SIGKILL",
+            "development CLI wrapper did not exit within 3 seconds after tree SIGTERM",
           );
           wrapperExited = true;
         } catch (error) {
           cleanupErrors.push(error);
         }
-      }
-      if (wrapperExited) children.delete(child);
-
-      const observedUrl = url ?? output.match(/yaca listening at (http:\/\/127\.0\.0\.1:\d+)/)?.[1];
-      const observedEndpoint = observedUrl ? new URL(observedUrl) : undefined;
-      const appPort = observedEndpoint ? Number(observedEndpoint.port) : undefined;
-      const targetPorts =
-        appPort === undefined
-          ? []
-          : process.platform === "win32" && authorityPorts
-            ? [appPort, ...authorityPorts]
-            : [appPort];
-      let endpointDown = observedUrl === undefined;
-      if (observedEndpoint && targetPorts.length > 0) {
-        try {
-          endpointDown = await waitForPortsClosed(observedEndpoint.hostname, targetPorts, 3_000);
-        } catch (error) {
-          cleanupErrors.push(
-            new Error(`could not prove the development Host endpoint closed: ${observedUrl}`, {
-              cause: error,
-            }),
-          );
-        }
-      }
-      if (observedUrl && !endpointDown) {
-        cleanupErrors.push(new Error(`development Host endpoint did not close: ${observedUrl}`));
-        if (process.platform === "win32") {
-          if (!wrapperExited) {
-            try {
-              await signalProcessTree(child, "SIGKILL", true);
-            } catch (error) {
-              cleanupErrors.push(error);
-            }
+        if (!wrapperExited) {
+          try {
+            await signalProcessTree(child, "SIGKILL");
+            await withDeadline(
+              childExit,
+              3_000,
+              "development CLI wrapper did not exit within 3 seconds after tree SIGKILL",
+            );
+            wrapperExited = true;
+          } catch (error) {
+            cleanupErrors.push(error);
           }
-          cleanupErrors.push(...(await forceKillWindowsListeners(new Set(targetPorts))));
-        } else {
+        }
+        if (wrapperExited) children.delete(child);
+
+        const observedUrl =
+          url ?? output.match(/yaca listening at (http:\/\/127\.0\.0\.1:\d+)/)?.[1];
+        const observedEndpoint = observedUrl ? new URL(observedUrl) : undefined;
+        const appPort = observedEndpoint ? Number(observedEndpoint.port) : undefined;
+        const targetPorts = appPort === undefined ? [] : [appPort];
+        let endpointDown = observedUrl === undefined;
+        if (observedEndpoint && targetPorts.length > 0) {
+          try {
+            endpointDown = await waitForPortsClosed(observedEndpoint.hostname, targetPorts, 3_000);
+          } catch (error) {
+            cleanupErrors.push(
+              new Error(`could not prove the development Host endpoint closed: ${observedUrl}`, {
+                cause: error,
+              }),
+            );
+          }
+        }
+        if (observedUrl && !endpointDown) {
+          cleanupErrors.push(new Error(`development Host endpoint did not close: ${observedUrl}`));
           try {
             await signalProcessTree(child, "SIGKILL", true);
           } catch (error) {
             cleanupErrors.push(error);
           }
-        }
-        let downAfterForce = false;
-        try {
-          downAfterForce = await waitForPortsClosed(
-            observedEndpoint?.hostname ?? "127.0.0.1",
-            targetPorts,
-            3_000,
-          );
-        } catch (error) {
-          cleanupErrors.push(
-            new Error(
-              `could not prove the endpoint closed after a second tree kill: ${observedUrl}`,
-              {
-                cause: error,
-              },
-            ),
-          );
-        }
-        if (!downAfterForce) {
-          cleanupErrors.push(
-            new Error(
-              `development Host remained reachable after a second tree kill: ${observedUrl}`,
-            ),
-          );
+          let downAfterForce = false;
+          try {
+            downAfterForce = await waitForPortsClosed(
+              observedEndpoint?.hostname ?? "127.0.0.1",
+              targetPorts,
+              3_000,
+            );
+          } catch (error) {
+            cleanupErrors.push(
+              new Error(
+                `could not prove the endpoint closed after a second tree kill: ${observedUrl}`,
+                {
+                  cause: error,
+                },
+              ),
+            );
+          }
+          if (!downAfterForce) {
+            cleanupErrors.push(
+              new Error(
+                `development Host remained reachable after a second tree kill: ${observedUrl}`,
+              ),
+            );
+          }
         }
       }
-    }
 
-    const errors = [...(testError ? [testError] : []), ...cleanupErrors];
-    if (errors.length === 1) throw errors[0];
-    if (errors.length > 1) throw new AggregateError(errors, "development CLI smoke failed");
-  }, 60_000);
+      const errors = [...(testError ? [testError] : []), ...cleanupErrors];
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) throw new AggregateError(errors, "development CLI smoke failed");
+    },
+    60_000,
+  );
 
   test("restarts immediately after SIGKILL releases the kernel authority fence", async () => {
     const temporary = await mkdtemp(join(tmpdir(), "yaca-crash-cli-"));
