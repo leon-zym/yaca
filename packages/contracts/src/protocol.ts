@@ -7,12 +7,17 @@ const nullable = <T extends TSchema>(schema: T) => Type.Union([schema, Type.Null
 const utf8Length = (value: string) => new TextEncoder().encode(value).byteLength;
 const utf8String = (maximum: number, minimum = 0) =>
   Type.Refine(
-    Type.String({ default: minimum > 0 ? "x" : "" }),
+    Type.String({ default: "x".repeat(minimum) }),
+    (value) => utf8Length(value) >= minimum && utf8Length(value) <= maximum,
+  );
+const utf8Pattern = (maximum: number, minimum: number, pattern: string, defaultValue: string) =>
+  Type.Refine(
+    Type.String({ pattern, default: defaultValue }),
     (value) => utf8Length(value) >= minimum && utf8Length(value) <= maximum,
   );
 const trimmed = (maximum: number) =>
   Type.Refine(
-    Type.String({ minLength: 1, maxLength: maximum, default: "x" }),
+    utf8String(maximum, 1),
     (value) =>
       value === value.trim() &&
       ![...value].some((character) => {
@@ -22,30 +27,19 @@ const trimmed = (maximum: number) =>
   );
 
 export const FRAME_BYTE_LIMIT = 1_048_576;
-export const OpaqueIdSchema = Type.String({
-  minLength: 1,
-  maxLength: 128,
-  pattern: "^[A-Za-z0-9_-]+$",
-  default: "x",
-});
+export const OpaqueIdSchema = utf8Pattern(128, 1, "^[A-Za-z0-9_-]+$", "x");
 export const RequestIdSchema = OpaqueIdSchema;
 export const MutationIdSchema = OpaqueIdSchema;
 export const SessionVersionSchema = OpaqueIdSchema;
 export const RuntimeEpochSchema = OpaqueIdSchema;
-export const CursorSchema = Type.String({ minLength: 1, maxLength: 512 });
-export const IsoInstantSchema = Type.String({
-  format: "date-time",
-  maxLength: 40,
-  default: "1970-01-01T00:00:00.000Z",
-});
+export const CursorSchema = utf8String(512, 1);
+export const IsoInstantSchema = Type.Refine(
+  Type.String({ format: "date-time", default: "1970-01-01T00:00:00.000Z" }),
+  (value) => utf8Length(value) <= 40 && value.endsWith("Z"),
+);
 export const DisplayNameSchema = trimmed(128);
 export const SessionTitleSchema = trimmed(200);
-export const LocalPathInputSchema = Type.String({
-  minLength: 1,
-  maxLength: 4096,
-  pattern: "^[^\\u0000]+$",
-  default: ".",
-});
+export const LocalPathInputSchema = utf8Pattern(4096, 1, "^[^\\u0000]+$", ".");
 export const DisplayPathSchema = LocalPathInputSchema;
 export const SafeTextSchema = utf8String(65_536);
 export const SequenceSchema = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
@@ -175,15 +169,15 @@ export const ErrorCodeSchema = Type.Enum([
 ]);
 
 export const ErrorDetailsSchema = closed({
-  field: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
-  expected: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
-  actual: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+  field: Type.Optional(utf8String(128, 1)),
+  expected: Type.Optional(utf8String(512, 1)),
+  actual: Type.Optional(utf8String(512, 1)),
   receiptId: Type.Optional(OpaqueIdSchema),
   activeRunId: Type.Optional(OpaqueIdSchema),
 });
 export const AppErrorSchema = closed({
   code: ErrorCodeSchema,
-  message: Type.String({ minLength: 1, maxLength: 1000 }),
+  message: utf8String(1000, 1),
   retryDisposition: RetryDispositionSchema,
   details: Type.Optional(ErrorDetailsSchema),
 });
@@ -219,7 +213,7 @@ export const TrashRecordSchema = closed({
   originalSessionVersion: SessionVersionSchema,
   trashedAt: IsoInstantSchema,
   restorable: Type.Boolean(),
-  restoreBlockedReason: nullable(Type.String({ minLength: 1, maxLength: 500 })),
+  restoreBlockedReason: nullable(utf8String(500, 1)),
 });
 export const ModelRefSchema = closed({ providerId: OpaqueIdSchema, modelId: OpaqueIdSchema });
 export const ModelCatalogEntrySchema = closed({
@@ -325,9 +319,9 @@ export const ContentReferenceSchema = closed({
   contentRef: OpaqueIdSchema,
   sessionId: OpaqueIdSchema,
   kind: Type.Enum(["text", "terminal", "diff", "json", "binary"]),
-  mediaType: Type.String({ minLength: 1, maxLength: 200 }),
+  mediaType: utf8String(200, 1),
   byteLength: ByteCountSchema,
-  digest: Type.String({ minLength: 64, maxLength: 64 }),
+  digest: utf8String(64, 64),
   available: Type.Boolean(),
 });
 export const ContentPreviewSchema = closed({
@@ -362,7 +356,7 @@ function jsonWithinLimits(value: unknown): boolean {
       return (
         entries.length <= 1024 &&
         entries.every(
-          ([key, item]) => key.length >= 1 && key.length <= 256 && visit(item, depth + 1),
+          ([key, item]) => utf8Length(key) >= 1 && utf8Length(key) <= 256 && visit(item, depth + 1),
         )
       );
     }
@@ -424,7 +418,7 @@ export const BashDetailsSchema = closed({
   command: utf8String(262_144, 1),
   output: ContentPreviewSchema,
   exitCode: nullable(Type.Integer({ minimum: -2147483648, maximum: 2147483647 })),
-  signal: nullable(Type.String({ minLength: 1, maxLength: 64 })),
+  signal: nullable(utf8String(64, 1)),
   durationMs: nullable(DurationMsSchema),
 });
 export const UnknownToolDetailsSchema = closed({
@@ -441,13 +435,13 @@ export const ToolDetailsSchema = Type.Union([
 ]);
 const toolFields = {
   toolCallId: OpaqueIdSchema,
-  name: Type.String({ minLength: 1, maxLength: 256 }),
+  name: utf8String(256, 1),
   toolKind: ToolKindSchema,
   argumentsPreview: utf8String(65_536),
   argumentsTruncated: Type.Boolean(),
   argumentsContent: nullable(ContentReferenceSchema),
   executionStatus: ToolExecutionStatusSchema,
-  summary: Type.String({ maxLength: 1000 }),
+  summary: Type.Refine(Type.String({ default: "x" }), (value) => utf8Length(value) <= 1000),
   details: nullable(ToolDetailsSchema),
   startedAt: nullable(IsoInstantSchema),
   terminalAt: nullable(IsoInstantSchema),
@@ -524,7 +518,7 @@ export const SessionSyncViewSchema = closed({
 });
 export const DegradedViewSchema = closed({
   code: ErrorCodeSchema,
-  message: Type.String({ minLength: 1, maxLength: 1000 }),
+  message: utf8String(1000, 1),
   since: IsoInstantSchema,
 });
 export const SessionCatalogPageSchema = closed({
@@ -772,6 +766,35 @@ export const CommandEnvelopeSchema = Type.Union([
   RuntimeSetDesiredThinkingCommandSchema,
 ]);
 export type CommandEnvelope = Static<typeof CommandEnvelopeSchema>;
+export const COMMAND_ENVELOPE_SCHEMAS = {
+  "app.bootstrap": AppBootstrapCommandSchema,
+  "app.sync": AppSyncCommandSchema,
+  "app.setThemePreference": SetThemePreferenceCommandSchema,
+  "workspace.list": WorkspaceListCommandSchema,
+  "workspace.register": WorkspaceRegisterCommandSchema,
+  "workspace.select": WorkspaceSelectCommandSchema,
+  "workspace.updateDisplayName": WorkspaceUpdateDisplayNameCommandSchema,
+  "workspace.remove": WorkspaceRemoveCommandSchema,
+  "session.list": SessionListCommandSchema,
+  "session.create": SessionCreateCommandSchema,
+  "session.activate": SessionActivateCommandSchema,
+  "session.inspect": SessionInspectCommandSchema,
+  "session.rename": SessionRenameCommandSchema,
+  "session.trash": SessionTrashCommandSchema,
+  "session.trash.list": SessionTrashListCommandSchema,
+  "session.trash.restore": SessionTrashRestoreCommandSchema,
+  "session.sync": SessionSyncCommandSchema,
+  "session.history": SessionHistoryCommandSchema,
+  "run.prompt": RunPromptCommandSchema,
+  "run.abort": RunAbortCommandSchema,
+  "command.status": CommandStatusCommandSchema,
+  "command.acknowledgeUnknown": CommandAcknowledgeUnknownCommandSchema,
+  "runtime.setDesiredModel": RuntimeSetDesiredModelCommandSchema,
+  "runtime.setDesiredThinking": RuntimeSetDesiredThinkingCommandSchema,
+} as const satisfies Record<CommandType, TSchema>;
+export type CommandEnvelopeByType = {
+  readonly [K in CommandType]: Static<(typeof COMMAND_ENVELOPE_SCHEMAS)[K]>;
+};
 
 export const SetThemePreferenceResultSchema = closed({
   receipt: CommandReceiptSchema,
@@ -860,6 +883,37 @@ export const CommandResultSchema = Type.Union([
   CommandAcknowledgeUnknownResultSchema,
   DesiredSettingsResultSchema,
 ]);
+const successResponse = <const R extends TSchema>(result: R) =>
+  closed({ v: Type.Literal(1), requestId: RequestIdSchema, ok: Type.Literal(true), result });
+export const COMMAND_RESPONSE_SCHEMAS = {
+  "app.bootstrap": successResponse(BootstrapResultSchema),
+  "app.sync": successResponse(AppSyncResultSchema),
+  "app.setThemePreference": successResponse(SetThemePreferenceResultSchema),
+  "workspace.list": successResponse(WorkspaceListResultSchema),
+  "workspace.register": successResponse(WorkspaceResultSchema),
+  "workspace.select": successResponse(WorkspaceSelectResultSchema),
+  "workspace.updateDisplayName": successResponse(WorkspaceResultSchema),
+  "workspace.remove": successResponse(WorkspaceRemoveResultSchema),
+  "session.list": successResponse(SessionCatalogPageSchema),
+  "session.create": successResponse(SessionCreateResultSchema),
+  "session.activate": successResponse(SessionActivateResultSchema),
+  "session.inspect": successResponse(SessionInspectResultSchema),
+  "session.rename": successResponse(SessionResultSchema),
+  "session.trash": successResponse(SessionTrashResultSchema),
+  "session.trash.list": successResponse(TrashCatalogPageSchema),
+  "session.trash.restore": successResponse(SessionResultSchema),
+  "session.sync": successResponse(SessionSyncResultSchema),
+  "session.history": successResponse(SessionHistoryResultSchema),
+  "run.prompt": successResponse(RunPromptResultSchema),
+  "run.abort": successResponse(RunAbortResultSchema),
+  "command.status": successResponse(CommandStatusResultSchema),
+  "command.acknowledgeUnknown": successResponse(CommandAcknowledgeUnknownResultSchema),
+  "runtime.setDesiredModel": successResponse(DesiredSettingsResultSchema),
+  "runtime.setDesiredThinking": successResponse(DesiredSettingsResultSchema),
+} as const satisfies Record<CommandType, TSchema>;
+export type CommandResponseByType = {
+  readonly [K in CommandType]: Static<(typeof COMMAND_RESPONSE_SCHEMAS)[K]>;
+};
 
 export const COMMAND_PAYLOAD_SCHEMAS = {
   "app.bootstrap": AppBootstrapPayloadSchema,
@@ -920,12 +974,7 @@ export type CommandResultByType = {
   readonly [K in CommandType]: Static<(typeof COMMAND_RESULT_SCHEMAS)[K]>;
 };
 
-export const SuccessResponseSchema = closed({
-  v: Type.Literal(1),
-  requestId: RequestIdSchema,
-  ok: Type.Literal(true),
-  result: CommandResultSchema,
-});
+export const SuccessResponseSchema = Type.Union(Object.values(COMMAND_RESPONSE_SCHEMAS));
 export const ErrorResponseSchema = closed({
   v: Type.Literal(1),
   requestId: RequestIdSchema,
@@ -1043,9 +1092,21 @@ export const BlockSettledPayloadSchema = closed({
   block: ContentBlockSchema,
 });
 const PreparingToolCallSchema = closed({
-  ...toolFields,
+  toolCallId: OpaqueIdSchema,
+  name: utf8String(256, 1),
+  toolKind: Type.Enum(["read", "edit", "write", "bash", "unknown"], {
+    default: "unknown",
+  }),
   declarationStatus: Type.Literal("preparing"),
+  argumentsPreview: Type.Literal(""),
+  argumentsTruncated: Type.Literal(false),
   arguments: Type.Null(),
+  argumentsContent: Type.Null(),
+  executionStatus: Type.Literal("pending"),
+  summary: Type.Refine(Type.String({ default: "x" }), (value) => utf8Length(value) <= 1000),
+  details: Type.Null(),
+  startedAt: IsoInstantSchema,
+  terminalAt: Type.Null(),
   error: Type.Null(),
 });
 const ReadyToolCallSchema = closed({
@@ -1060,12 +1121,19 @@ const InvalidToolCallSchema = closed({
   arguments: Type.Null(),
   error: AppErrorSchema,
 });
-export const ToolDeclarationStartedBlockSchema = closed({
-  kind: Type.Literal("tool"),
-  ...blockBase,
-  status: Type.Literal("streaming"),
-  tool: PreparingToolCallSchema,
-});
+export const ToolDeclarationStartedBlockSchema = Type.Refine(
+  closed({
+    kind: Type.Literal("tool"),
+    ...blockBase,
+    status: Type.Literal("streaming"),
+    tool: PreparingToolCallSchema,
+  }),
+  (block) => {
+    const builtInKinds = new Set(["read", "edit", "write", "bash"]);
+    const expectedKind = builtInKinds.has(block.tool.name) ? block.tool.name : "unknown";
+    return block.tool.summary === block.tool.name && block.tool.toolKind === expectedKind;
+  },
+);
 export const ToolDeclarationSettledBlockSchema = Type.Union([
   closed({
     kind: Type.Literal("tool"),
@@ -1339,6 +1407,31 @@ export const HostDegradedEventSchema = event(
   },
   HostDegradedPayloadSchema,
 );
+export const EVENT_ENVELOPE_SCHEMAS = {
+  "app.theme_changed": ThemeChangedEventSchema,
+  "workspace.changed": WorkspaceChangedEventSchema,
+  "session.directory_changed": SessionDirectoryChangedEventSchema,
+  "active_session.changed": ActiveSessionChangedEventSchema,
+  "desired_settings.changed": DesiredSettingsChangedEventSchema,
+  "run.started": RunStartedEventSchema,
+  "assistant_step.started": AssistantStepStartedEventSchema,
+  "block.started": BlockStartedEventSchema,
+  "block.delta": BlockDeltaEventSchema,
+  "block.settled": BlockSettledEventSchema,
+  "tool.declaration_started": ToolDeclarationStartedEventSchema,
+  "tool.declaration_delta": ToolDeclarationDeltaEventSchema,
+  "tool.declaration_settled": ToolDeclarationSettledEventSchema,
+  "tool.execution_started": ToolExecutionStartedEventSchema,
+  "tool.execution_updated": ToolExecutionUpdatedEventSchema,
+  "tool.execution_settled": ToolExecutionSettledEventSchema,
+  "run.state_changed": RunStateChangedEventSchema,
+  "session.committed": SessionCommittedEventSchema,
+  "command.receipt_changed": CommandReceiptChangedEventSchema,
+  "host.degraded": HostDegradedEventSchema,
+} as const satisfies Record<EventType, TSchema>;
+export type EventEnvelopeByType = {
+  readonly [K in EventType]: Static<(typeof EVENT_ENVELOPE_SCHEMAS)[K]>;
+};
 export const EventEnvelopeSchema = Type.Union([
   ThemeChangedEventSchema,
   WorkspaceChangedEventSchema,
@@ -1368,7 +1461,7 @@ export const HelloSchema = closed({
   protocolMajor: Type.Literal(1),
   protocolMinor: Type.Integer({ minimum: 0, maximum: 65535 }),
   clientId: OpaqueIdSchema,
-  capabilities: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
+  capabilities: Type.Array(utf8String(128, 1), {
     maxItems: 128,
     uniqueItems: true,
     default: [],
@@ -1379,8 +1472,8 @@ export const WelcomeSchema = closed({
   protocolMajor: Type.Literal(1),
   protocolMinor: Type.Integer({ minimum: 0, maximum: 65535 }),
   connectionId: OpaqueIdSchema,
-  serverVersion: Type.String({ minLength: 1, maxLength: 128 }),
-  capabilities: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
+  serverVersion: utf8String(128, 1),
+  capabilities: Type.Array(utf8String(128, 1), {
     maxItems: 128,
     uniqueItems: true,
     default: [],
@@ -1423,14 +1516,83 @@ const frameTooLarge = (): CodecResult<never> => ({
     retryDisposition: "never",
   },
 });
-export function decodeApplicationFrame(serialized: string): CodecResult<ApplicationFrame> {
+const unsupportedProtocol = (): CodecResult<never> => ({
+  ok: false,
+  error: {
+    code: "unsupported_protocol",
+    message: "Protocol major version is not supported.",
+    retryDisposition: "never",
+  },
+});
+const unsupportedCommand = (): CodecResult<never> => ({
+  ok: false,
+  error: {
+    code: "unsupported_command",
+    message: "Command type is not supported.",
+    retryDisposition: "never",
+  },
+});
+const protocolViolation = (): CodecResult<never> => ({
+  ok: false,
+  error: {
+    code: "protocol_violation",
+    message: "Server frame violates the yaca protocol.",
+    retryDisposition: "never",
+  },
+});
+const HelloVersionProbeSchema = closed({
+  type: Type.Literal("hello"),
+  protocolMajor: Type.Integer(),
+  protocolMinor: Type.Integer({ minimum: 0, maximum: 65535 }),
+  clientId: OpaqueIdSchema,
+  capabilities: Type.Array(utf8String(128, 1), { maxItems: 128, uniqueItems: true }),
+});
+const WelcomeVersionProbeSchema = closed({
+  type: Type.Literal("welcome"),
+  protocolMajor: Type.Integer(),
+  protocolMinor: Type.Integer({ minimum: 0, maximum: 65535 }),
+  connectionId: OpaqueIdSchema,
+  serverVersion: utf8String(128, 1),
+  capabilities: Type.Array(utf8String(128, 1), { maxItems: 128, uniqueItems: true }),
+  connectionSeq: SequenceSchema,
+});
+const CommandProbeSchema = closed({
+  v: Type.Literal(1),
+  requestId: RequestIdSchema,
+  type: utf8String(128, 1),
+  clientMutationId: nullable(MutationIdSchema),
+  sessionId: nullable(OpaqueIdSchema),
+  expectedSessionVersion: nullable(SessionVersionSchema),
+  payload: Type.Unknown(),
+});
+function parseFrame(
+  serialized: string,
+  malformed: () => CodecResult<never>,
+  oversized: () => CodecResult<never> = frameTooLarge,
+): CodecResult<unknown> {
   try {
-    if (utf8Length(serialized) > FRAME_BYTE_LIMIT) return frameTooLarge();
+    if (utf8Length(serialized) > FRAME_BYTE_LIMIT) return oversized();
     const value: unknown = JSON.parse(serialized);
-    return Value.Check(ApplicationFrameSchema, value) ? { ok: true, value } : invalidFrame();
+    return { ok: true, value };
   } catch {
-    return invalidFrame();
+    return malformed();
   }
+}
+function hasMajorMismatch(schema: TSchema, value: unknown): boolean {
+  return Value.Check(schema, value) && (value as { protocolMajor: number }).protocolMajor !== 1;
+}
+function isUnknownCommand(value: unknown): boolean {
+  return (
+    Value.Check(CommandProbeSchema, value) &&
+    !Value.Check(CommandTypeSchema, (value as { type: unknown }).type)
+  );
+}
+export function decodeApplicationFrame(serialized: string): CodecResult<ApplicationFrame> {
+  const parsed = parseFrame(serialized, invalidFrame);
+  if (!parsed.ok) return parsed;
+  return Value.Check(ApplicationFrameSchema, parsed.value)
+    ? { ok: true, value: parsed.value }
+    : invalidFrame();
 }
 export function encodeApplicationFrame(value: unknown): CodecResult<string> {
   try {
@@ -1443,39 +1605,53 @@ export function encodeApplicationFrame(value: unknown): CodecResult<string> {
     return invalidFrame();
   }
 }
-function decodeFrame<T extends TSchema>(schema: T, serialized: string): CodecResult<Static<T>> {
+function serializeFrame(
+  schema: TSchema,
+  value: unknown,
+  malformed: () => CodecResult<never>,
+  oversized: () => CodecResult<never> = frameTooLarge,
+): CodecResult<string> {
   try {
-    if (utf8Length(serialized) > FRAME_BYTE_LIMIT) return frameTooLarge();
-    const value: unknown = JSON.parse(serialized);
-    return Value.Check(schema, value) ? { ok: true, value: value as Static<T> } : invalidFrame();
-  } catch {
-    return invalidFrame();
-  }
-}
-function encodeFrame<T extends TSchema>(schema: T, value: unknown): CodecResult<string> {
-  try {
-    if (!Value.Check(schema, value)) return invalidFrame();
+    if (!Value.Check(schema, value)) return malformed();
     const serialized = JSON.stringify(value);
     return utf8Length(serialized) > FRAME_BYTE_LIMIT
-      ? frameTooLarge()
+      ? oversized()
       : { ok: true, value: serialized };
   } catch {
-    return invalidFrame();
+    return malformed();
   }
 }
-export const decodeClientFrame = (serialized: string): CodecResult<ClientFrame> =>
-  decodeFrame(ClientFrameSchema, serialized);
-export const decodeServerFrame = (serialized: string): CodecResult<ServerFrame> =>
-  decodeFrame(ServerFrameSchema, serialized);
-export const encodeClientFrame = (value: unknown): CodecResult<string> =>
-  encodeFrame(ClientFrameSchema, value);
-export const encodeServerFrame = (value: unknown): CodecResult<string> =>
-  encodeFrame(ServerFrameSchema, value);
+export function decodeClientFrame(serialized: string): CodecResult<ClientFrame> {
+  const parsed = parseFrame(serialized, invalidFrame);
+  if (!parsed.ok) return parsed;
+  if (hasMajorMismatch(HelloVersionProbeSchema, parsed.value)) return unsupportedProtocol();
+  if (isUnknownCommand(parsed.value)) return unsupportedCommand();
+  return Value.Check(ClientFrameSchema, parsed.value)
+    ? { ok: true, value: parsed.value }
+    : invalidFrame();
+}
+export function decodeServerFrame(serialized: string): CodecResult<ServerFrame> {
+  const parsed = parseFrame(serialized, protocolViolation, protocolViolation);
+  if (!parsed.ok) return parsed;
+  if (hasMajorMismatch(WelcomeVersionProbeSchema, parsed.value)) return unsupportedProtocol();
+  return Value.Check(ServerFrameSchema, parsed.value)
+    ? { ok: true, value: parsed.value }
+    : protocolViolation();
+}
+export function encodeClientFrame(value: unknown): CodecResult<string> {
+  if (hasMajorMismatch(HelloVersionProbeSchema, value)) return unsupportedProtocol();
+  if (isUnknownCommand(value)) return unsupportedCommand();
+  return serializeFrame(ClientFrameSchema, value, invalidFrame);
+}
+export function encodeServerFrame(value: unknown): CodecResult<string> {
+  if (hasMajorMismatch(WelcomeVersionProbeSchema, value)) return unsupportedProtocol();
+  return serializeFrame(ServerFrameSchema, value, protocolViolation, protocolViolation);
+}
 
 export const HealthResponseSchema = closed({
   status: Type.Literal("ok"),
   service: Type.Literal("yaca-host"),
-  version: Type.String({ minLength: 1, maxLength: 128 }),
+  version: utf8String(128, 1),
   uptimeSeconds: Type.Number({ minimum: 0 }),
   authorityPorts: Type.Tuple([
     Type.Integer({ minimum: 49_152, maximum: 65_535 }),

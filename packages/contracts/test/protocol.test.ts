@@ -6,26 +6,37 @@ import { describe, expect, it } from "vitest";
 import {
   ApplicationFrameSchema,
   BlockDeltaPayloadSchema,
+  COMMAND_ENVELOPE_SCHEMAS,
   COMMAND_PAYLOAD_SCHEMAS,
+  COMMAND_RESPONSE_SCHEMAS,
   COMMAND_RESULT_SCHEMAS,
   CommandEnvelopeSchema,
   CommandReceiptSchema,
   COMMAND_TYPES,
+  CursorSchema,
+  decodeClientFrame,
   decodeApplicationFrame,
+  decodeServerFrame,
+  DisplayNameSchema,
+  encodeClientFrame,
   encodeApplicationFrame,
+  encodeServerFrame,
   ErrorResponseSchema,
   EventEnvelopeSchema,
+  EVENT_ENVELOPE_SCHEMAS,
   EVENT_PAYLOAD_SCHEMAS,
   EVENT_TYPES,
   HelloSchema,
   MUTATION_AUTHORITY,
   MUTATION_COMMAND_TYPES,
+  RunEnvelopeSchema,
   RunPromptPayloadSchema,
   SessionCatalogPageRequestSchema,
   SuccessResponseSchema,
   ThemeSettingSchema,
   ContentPreviewSchema,
   ToolDeclarationSettledPayloadSchema,
+  ToolDeclarationStartedPayloadSchema,
   Value,
   WelcomeSchema,
 } from "../src/index.js";
@@ -137,6 +148,7 @@ describe("closed application protocol", () => {
     expect(Value.Check(CommandReceiptSchema, restart.recordedPromptAfterRestart)).toBe(true);
     const accepted = restart.acceptedPromptAfterRestart as Record<string, unknown>;
     expect(Value.Check(CommandReceiptSchema, accepted.receipt)).toBe(true);
+    expect(Value.Check(RunEnvelopeSchema, accepted.run)).toBe(true);
 
     const trash = fixture("active-session-trash.json");
     expect(Value.Check(ErrorResponseSchema, trash.runningRejection)).toBe(true);
@@ -157,6 +169,9 @@ describe("closed application protocol", () => {
     expect(Object.keys(COMMAND_PAYLOAD_SCHEMAS).sort()).toEqual([...COMMAND_TYPES].sort());
     expect(Object.keys(COMMAND_RESULT_SCHEMAS).sort()).toEqual([...COMMAND_TYPES].sort());
     expect(Object.keys(EVENT_PAYLOAD_SCHEMAS).sort()).toEqual([...EVENT_TYPES].sort());
+    expect(Object.keys(COMMAND_ENVELOPE_SCHEMAS).sort()).toEqual([...COMMAND_TYPES].sort());
+    expect(Object.keys(COMMAND_RESPONSE_SCHEMAS).sort()).toEqual([...COMMAND_TYPES].sort());
+    expect(Object.keys(EVENT_ENVELOPE_SCHEMAS).sort()).toEqual([...EVENT_TYPES].sort());
   });
 
   it("keeps every wire object closed except intentional JsonValue records", () => {
@@ -197,6 +212,135 @@ describe("closed application protocol", () => {
     invalid.block.tool.arguments = null;
     invalid.block.tool.error = null;
     expect(Value.Check(ToolDeclarationSettledPayloadSchema, invalid)).toBe(false);
+  });
+
+  it("enforces every deterministic tool declaration start field", () => {
+    const tool = fixture("tool-declaration-stream.json");
+    const started = (tool.events as Array<Record<string, unknown>>)[0]?.payload;
+    expect(Value.Check(ToolDeclarationStartedPayloadSchema, started)).toBe(true);
+    const mutations = [
+      ["status", "settled"],
+      ["argumentsPreview", "{}"],
+      ["declarationStatus", "ready"],
+      ["argumentsTruncated", true],
+      ["arguments", {}],
+      ["argumentsContent", {}],
+      ["executionStatus", "running"],
+      ["summary", "not-the-tool-name"],
+      ["details", {}],
+      ["startedAt", null],
+      ["terminalAt", "2026-08-19T03:01:11.000Z"],
+      ["error", { code: "invalid_frame", message: "bad", retryDisposition: "never" }],
+      ["toolKind", "bash"],
+    ] as const;
+    for (const [field, value] of mutations) {
+      const invalid = structuredClone(started) as Record<string, unknown>;
+      const block = invalid.block as Record<string, unknown>;
+      if (field === "status") block.status = value;
+      else (block.tool as Record<string, unknown>)[field] = value;
+      expect(Value.Check(ToolDeclarationStartedPayloadSchema, invalid), field).toBe(false);
+    }
+  });
+
+  it("classifies client and server codec failures without exception leakage", () => {
+    const errorCode = (result: ReturnType<typeof decodeClientFrame>) =>
+      result.ok ? "ok" : result.error.code;
+    expect(errorCode(decodeClientFrame("{bad"))).toBe("invalid_frame");
+    expect(
+      errorCode(
+        decodeClientFrame(
+          JSON.stringify({
+            type: "hello",
+            protocolMajor: 2,
+            protocolMinor: 0,
+            clientId: "web",
+            capabilities: [],
+          }),
+        ),
+      ),
+    ).toBe("unsupported_protocol");
+    expect(
+      errorCode(
+        decodeClientFrame(
+          JSON.stringify({
+            v: 1,
+            requestId: "r",
+            type: "future.command",
+            clientMutationId: null,
+            sessionId: null,
+            expectedSessionVersion: null,
+            payload: {},
+          }),
+        ),
+      ),
+    ).toBe("unsupported_command");
+    const impossibleServer = decodeServerFrame("{bad");
+    expect(impossibleServer.ok ? "ok" : impossibleServer.error.code).toBe("protocol_violation");
+    const oversizedServer = decodeServerFrame(`{"value":"${"x".repeat(1_048_576)}"}`);
+    expect(oversizedServer.ok ? "ok" : oversizedServer.error.code).toBe("protocol_violation");
+    const majorServer = decodeServerFrame(
+      JSON.stringify({
+        type: "welcome",
+        protocolMajor: 2,
+        protocolMinor: 0,
+        connectionId: "c",
+        serverVersion: "1",
+        capabilities: [],
+        connectionSeq: 0,
+      }),
+    );
+    expect(majorServer.ok ? "ok" : majorServer.error.code).toBe("unsupported_protocol");
+    const impossibleEncode = encodeServerFrame({ type: "impossible" });
+    expect(impossibleEncode.ok ? "ok" : impossibleEncode.error.code).toBe("protocol_violation");
+    const unknownEncode = encodeClientFrame({
+      v: 1,
+      requestId: "r",
+      type: "future.command",
+      clientMutationId: null,
+      sessionId: null,
+      expectedSessionVersion: null,
+      payload: {},
+    });
+    expect(unknownEncode.ok ? "ok" : unknownEncode.error.code).toBe("unsupported_command");
+  });
+
+  it("round-trips every command, response, and event envelope by frame direction", () => {
+    for (const [name, schema] of Object.entries(COMMAND_ENVELOPE_SCHEMAS)) {
+      const value = Value.Create(schema);
+      const encoded = encodeClientFrame(value);
+      expect(encoded.ok, `${name} client encode`).toBe(true);
+      if (encoded.ok)
+        expect(decodeClientFrame(encoded.value), `${name} host decode`).toEqual({
+          ok: true,
+          value,
+        });
+      const unknown = encodeClientFrame({
+        ...(value as Record<string, unknown>),
+        unknown: true,
+      });
+      expect(unknown.ok ? "ok" : unknown.error.code, `${name} closed command`).toBe(
+        "invalid_frame",
+      );
+    }
+    for (const registries of [COMMAND_RESPONSE_SCHEMAS, EVENT_ENVELOPE_SCHEMAS]) {
+      for (const [name, schema] of Object.entries(registries)) {
+        const value = Value.Create(schema);
+        const encoded = encodeServerFrame(value);
+        expect(encoded.ok, `${name} server encode`).toBe(true);
+        if (encoded.ok)
+          expect(decodeServerFrame(encoded.value), `${name} client decode`).toEqual({
+            ok: true,
+            value,
+          });
+        const unknown = encodeServerFrame({
+          ...(value as Record<string, unknown>),
+          unknown: true,
+        });
+        expect(unknown.ok ? "ok" : unknown.error.code, `${name} closed server frame`).toBe(
+          "protocol_violation",
+        );
+      }
+    }
   });
 
   it("returns stable AppError values from codecs instead of leaking throws", () => {
@@ -281,5 +425,12 @@ describe("closed application protocol", () => {
     };
     expect(Value.Check(ContentPreviewSchema, preview)).toBe(true);
     expect(Value.Check(ContentPreviewSchema, { ...preview, text: `${preview.text}x` })).toBe(false);
+    const cursorAtLimit = `${"界".repeat(170)}xx`;
+    expect(Value.Check(CursorSchema, cursorAtLimit)).toBe(true);
+    expect(Value.Check(CursorSchema, `${cursorAtLimit}x`)).toBe(false);
+    const nameAtLimit = `${"界".repeat(42)}xx`;
+    expect(Value.Check(DisplayNameSchema, nameAtLimit)).toBe(true);
+    expect(Value.Check(DisplayNameSchema, `${nameAtLimit}x`)).toBe(false);
+    expect(Value.Check(RunPromptPayloadSchema, {})).toBe(false);
   });
 });
