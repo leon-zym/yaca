@@ -173,6 +173,20 @@ describe("closed application protocol", () => {
     visit(ApplicationFrameSchema);
   });
 
+  it("generates a minimum valid and unknown-field-invalid fixture for every payload/result variant", () => {
+    const registries = [COMMAND_PAYLOAD_SCHEMAS, COMMAND_RESULT_SCHEMAS, EVENT_PAYLOAD_SCHEMAS];
+    for (const registry of registries) {
+      for (const [name, schema] of Object.entries(registry)) {
+        const minimum = Value.Create(schema);
+        expect(Value.Check(schema, minimum), `${name} minimum`).toBe(true);
+        expect(
+          Value.Check(schema, { ...(minimum as Record<string, unknown>), unknown: true }),
+          `${name} unknown field`,
+        ).toBe(false);
+      }
+    }
+  });
+
   it("enforces declaration settlement XOR", () => {
     const tool = fixture("tool-declaration-stream.json");
     const settled = (tool.events as Array<Record<string, unknown>>)[3]?.payload;
@@ -248,7 +262,7 @@ describe("closed application protocol", () => {
         productTurnId: "turn",
         stepId: "step",
         blockId: "block",
-        append: "界".repeat(10_922),
+        append: `${"界".repeat(10_922)}xx`,
       }),
     ).toBe(true);
     expect(
@@ -256,7 +270,7 @@ describe("closed application protocol", () => {
         productTurnId: "turn",
         stepId: "step",
         blockId: "block",
-        append: "界".repeat(10_923),
+        append: `${"界".repeat(10_922)}xxx`,
       }),
     ).toBe(false);
     const preview = {

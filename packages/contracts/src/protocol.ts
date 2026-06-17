@@ -7,12 +7,12 @@ const nullable = <T extends TSchema>(schema: T) => Type.Union([schema, Type.Null
 const utf8Length = (value: string) => new TextEncoder().encode(value).byteLength;
 const utf8String = (maximum: number, minimum = 0) =>
   Type.Refine(
-    Type.String(),
+    Type.String({ default: minimum > 0 ? "x" : "" }),
     (value) => utf8Length(value) >= minimum && utf8Length(value) <= maximum,
   );
 const trimmed = (maximum: number) =>
   Type.Refine(
-    Type.String({ minLength: 1, maxLength: maximum }),
+    Type.String({ minLength: 1, maxLength: maximum, default: "x" }),
     (value) =>
       value === value.trim() &&
       ![...value].some((character) => {
@@ -26,25 +26,36 @@ export const OpaqueIdSchema = Type.String({
   minLength: 1,
   maxLength: 128,
   pattern: "^[A-Za-z0-9_-]+$",
+  default: "x",
 });
 export const RequestIdSchema = OpaqueIdSchema;
 export const MutationIdSchema = OpaqueIdSchema;
 export const SessionVersionSchema = OpaqueIdSchema;
 export const RuntimeEpochSchema = OpaqueIdSchema;
 export const CursorSchema = Type.String({ minLength: 1, maxLength: 512 });
-export const IsoInstantSchema = Type.String({ format: "date-time", maxLength: 40 });
+export const IsoInstantSchema = Type.String({
+  format: "date-time",
+  maxLength: 40,
+  default: "1970-01-01T00:00:00.000Z",
+});
 export const DisplayNameSchema = trimmed(128);
 export const SessionTitleSchema = trimmed(200);
 export const LocalPathInputSchema = Type.String({
   minLength: 1,
   maxLength: 4096,
   pattern: "^[^\\u0000]+$",
+  default: ".",
 });
 export const DisplayPathSchema = LocalPathInputSchema;
 export const SafeTextSchema = utf8String(65_536);
 export const SequenceSchema = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
 export const DurationMsSchema = SequenceSchema;
-export const ByteCountSchema = Type.String({ minLength: 1, maxLength: 32, pattern: "^[0-9]+$" });
+export const ByteCountSchema = Type.String({
+  minLength: 1,
+  maxLength: 32,
+  pattern: "^[0-9]+$",
+  default: "0",
+});
 
 export const ThemePreferenceSchema = Type.Enum(["system", "light", "dark"]);
 export const RuntimePhaseSchema = Type.Enum([
@@ -220,6 +231,7 @@ export const ModelCatalogEntrySchema = closed({
     minItems: 1,
     maxItems: 7,
     uniqueItems: true,
+    default: ["off"],
   }),
 });
 export const ModelCatalogSchema = closed({
@@ -338,6 +350,7 @@ const JsonValueBaseSchema = Type.Cyclic(
     ]),
   },
   "JsonValue",
+  { default: {} },
 );
 function jsonWithinLimits(value: unknown): boolean {
   const visit = (node: unknown, depth: number): boolean => {
@@ -503,7 +516,11 @@ export const SessionSyncViewSchema = closed({
   activeOverlay: nullable(ActiveOverlaySchema),
   desiredSettings: nullable(DesiredSettingsSchema),
   receipts: Type.Array(CommandReceiptSchema, { maxItems: 200 }),
-  mutationBlockedByReceiptIds: Type.Array(OpaqueIdSchema, { maxItems: 200, uniqueItems: true }),
+  mutationBlockedByReceiptIds: Type.Array(OpaqueIdSchema, {
+    maxItems: 200,
+    uniqueItems: true,
+    default: [],
+  }),
 });
 export const DegradedViewSchema = closed({
   code: ErrorCodeSchema,
@@ -1354,6 +1371,7 @@ export const HelloSchema = closed({
   capabilities: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
     maxItems: 128,
     uniqueItems: true,
+    default: [],
   }),
 });
 export const WelcomeSchema = closed({
@@ -1365,6 +1383,7 @@ export const WelcomeSchema = closed({
   capabilities: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), {
     maxItems: 128,
     uniqueItems: true,
+    default: [],
   }),
   connectionSeq: SequenceSchema,
 });
