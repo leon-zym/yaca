@@ -1,11 +1,13 @@
 export type PersistenceErrorCode =
   | "cross_device_rename"
+  | "degraded"
   | "invalid_json"
   | "io_failure"
   | "unsafe_symbolic_link";
 
 const ERROR_MESSAGES: Record<PersistenceErrorCode, string> = {
   cross_device_rename: "atomic replacement crossed a filesystem boundary",
+  degraded: "durable journal is degraded and read-only",
   invalid_json: "persistent data is not valid JSON",
   io_failure: "persistent storage operation failed",
   unsafe_symbolic_link: "persistent data must not be a symbolic link",

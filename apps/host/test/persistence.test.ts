@@ -126,7 +126,7 @@ describe("DurableJsonl", () => {
     ["file-fsync", [{ sequence: 1 }]],
     ["directory-fsync", [{ sequence: 1 }]],
   ] satisfies ReadonlyArray<readonly [PersistenceOperation, Array<{ sequence: number }>]>)(
-    "keeps a valid prefix and accepts the next append after a %s failure",
+    "locks queued and future appends after an uncertain %s failure",
     async (operation, recordsAfterFailure) => {
       const directory = await temporaryDirectory(`yaca-jsonl-${operation}-`);
       const target = join(directory, "events.jsonl");
@@ -140,17 +140,50 @@ describe("DurableJsonl", () => {
         },
       });
 
-      await expect(ledger.append({ sequence: 1 })).rejects.toMatchObject({ code: "io_failure" });
+      const uncertain = ledger.append({ sequence: 1 });
+      const alreadyQueued = ledger.append({ sequence: 2 });
+
+      await expect(uncertain).rejects.toMatchObject({ code: "io_failure" });
+      await expect(alreadyQueued).rejects.toMatchObject({ code: "degraded" });
+      expect(ledger.status).toBe("degraded");
       await expect(ledger.readValidPrefix()).resolves.toMatchObject({
         records: recordsAfterFailure,
       });
-      await ledger.append({ sequence: 2 });
-      await expect(ledger.readValidPrefix()).resolves.toMatchObject({
-        records: [...recordsAfterFailure, { sequence: 2 }],
-        quarantinedTail: null,
+      await expect(ledger.append({ sequence: 3 })).rejects.toMatchObject({
+        code: "degraded",
       });
     },
   );
+
+  test("settles every concurrently queued append after the first uncertain failure", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-concurrent-failure-");
+    const target = join(directory, "events.jsonl");
+    let injected = false;
+    const ledger = new DurableJsonl<{ sequence: number }>(target, {
+      faultInjector: (operation) => {
+        if (!injected && operation === "write") {
+          injected = true;
+          throw Object.assign(new Error(`injected at ${target}`), { code: "EIO" });
+        }
+      },
+    });
+
+    const outcomes = await Promise.allSettled(
+      Array.from({ length: 16 }, (_, sequence) => ledger.append({ sequence })),
+    );
+
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(Array(16).fill("rejected"));
+    expect(
+      outcomes.map((outcome) =>
+        outcome.status === "rejected" ? (outcome.reason as PersistenceError).code : "fulfilled",
+      ),
+    ).toEqual(["io_failure", ...Array(15).fill("degraded")]);
+    expect(ledger.status).toBe("degraded");
+    const laterFailure = await ledger.append({ sequence: 99 }).catch((error: unknown) => error);
+    expect(laterFailure).toMatchObject({ code: "degraded" });
+    expect((laterFailure as Error).message).not.toContain(target);
+    await expect(ledger.readValidPrefix()).resolves.toMatchObject({ records: [] });
+  });
 
   test.each([
     ["torn", Buffer.from('{"sequence":')],
@@ -166,17 +199,41 @@ describe("DurableJsonl", () => {
       const ledger = new DurableJsonl<{ sequence: number }>(target);
 
       const first = await ledger.readValidPrefix();
-      const second = await ledger.readValidPrefix();
 
       expect(first.records).toEqual([{ sequence: 1 }, { sequence: 2 }]);
       expect(first.quarantinedTail?.byteLength).toBe(tail.byteLength);
       await expect(readFile(first.quarantinedTail!.path)).resolves.toEqual(tail);
       expect((await lstat(first.quarantinedTail!.path)).mode & 0o777).toBe(0o600);
+      expect(ledger.status).toBe("degraded");
+      await expect(ledger.append({ sequence: 3 })).rejects.toMatchObject({ code: "degraded" });
+
+      const second = await ledger.readValidPrefix();
       expect(second.quarantinedTail?.path).not.toBe(first.quarantinedTail?.path);
       await expect(readFile(first.quarantinedTail!.path)).resolves.toEqual(tail);
       await expect(readFile(target)).resolves.toEqual(original);
     },
   );
+
+  test("reopens an existing partial tail as degraded before any append", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-reopen-tail-");
+    const target = join(directory, "events.jsonl");
+    const prefix = Buffer.from('{"sequence":1}\n');
+    const tail = Buffer.from('{"sequence":');
+    const original = Buffer.concat([prefix, tail]);
+    await writeFile(target, original, { mode: 0o600 });
+    const reopened = new DurableJsonl<{ sequence: number }>(target);
+
+    await expect(reopened.append({ sequence: 2 })).rejects.toMatchObject({ code: "degraded" });
+
+    expect(reopened.status).toBe("degraded");
+    await expect(readFile(target)).resolves.toEqual(original);
+    const quarantineDirectory = join(directory, "events.jsonl.quarantine");
+    const quarantineEntries = await readdir(quarantineDirectory);
+    expect(quarantineEntries).toHaveLength(1);
+    const quarantinePath = join(quarantineDirectory, quarantineEntries[0]!);
+    await expect(readFile(quarantinePath)).resolves.toEqual(tail);
+    expect((await lstat(quarantinePath)).mode & 0o777).toBe(0o600);
+  });
 
   test("rejects a symbolic-link ledger without changing its target", async () => {
     const directory = await temporaryDirectory("yaca-jsonl-link-");

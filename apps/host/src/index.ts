@@ -4,6 +4,7 @@ export {
   AtomicJsonFile,
   DurableJsonl,
   PersistenceError,
+  type DurableJsonlStatus,
   type JsonlReadResult,
   type PersistenceErrorCode,
   type PersistenceFaultInjector,

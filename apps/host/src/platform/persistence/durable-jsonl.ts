@@ -22,24 +22,42 @@ export interface JsonlReadResult<T> {
   quarantinedTail: QuarantinedJsonlTail | null;
 }
 
+export type DurableJsonlStatus = "healthy" | "degraded";
+
 export class DurableJsonl<T> {
   readonly #requestedPath: string;
   readonly #options: PersistenceOptions<T>;
+  #inspected = false;
   #pending: Promise<void> = Promise.resolve();
+  #status: DurableJsonlStatus = "healthy";
 
   constructor(path: string, options: PersistenceOptions<T> = {}) {
     this.#requestedPath = path;
     this.#options = options;
   }
 
+  get status(): DurableJsonlStatus {
+    return this.#status;
+  }
+
   append(value: T): Promise<void> {
-    const operation = this.#pending.then(() => this.#append(value));
+    if (this.#status === "degraded") {
+      return Promise.reject(new PersistenceError("degraded"));
+    }
+    const operation = this.#pending.then(() => {
+      if (this.#status === "degraded") throw new PersistenceError("degraded");
+      return this.#append(value);
+    });
     this.#pending = operation.catch(() => undefined);
     return operation;
   }
 
   async readValidPrefix(): Promise<JsonlReadResult<T>> {
     await this.#pending;
+    return this.#readValidPrefix();
+  }
+
+  async #readValidPrefix(): Promise<JsonlReadResult<T>> {
     const target = await resolveTarget(this.#requestedPath);
     let handle;
     let bytes: Buffer;
@@ -49,6 +67,7 @@ export class DurableJsonl<T> {
       bytes = await handle.readFile();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.#inspected = true;
         return { records: [], quarantinedTail: null };
       }
       throw persistenceError(error);
@@ -70,7 +89,9 @@ export class DurableJsonl<T> {
       }
     }
 
+    this.#inspected = true;
     if (offset === bytes.length) return { records, quarantinedTail: null };
+    this.#status = "degraded";
     const quarantinedTail = await this.#quarantine(
       target.directory,
       target.path,
@@ -80,6 +101,8 @@ export class DurableJsonl<T> {
   }
 
   async #append(value: T): Promise<void> {
+    if (!this.#inspected) await this.#readValidPrefix();
+    if (this.#status === "degraded") throw new PersistenceError("degraded");
     const target = await resolveTarget(this.#requestedPath);
     const bytes = Buffer.concat([serializeJson(value), Buffer.from("\n")]);
     let handle;
@@ -98,6 +121,7 @@ export class DurableJsonl<T> {
       handle = undefined;
       await syncDirectory(target.directory, this.#options.faultInjector);
     } catch (error) {
+      this.#status = "degraded";
       try {
         await handle?.close();
       } catch {
