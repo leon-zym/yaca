@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, realpath, stat, symlink } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readdir, realpath, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { prepareYacaPaths } from "@yaca/host";
@@ -52,6 +52,22 @@ describe("yaca persistence paths", () => {
     expect((await stat(paths.root)).mode & 0o777).toBe(0o700);
   });
 
+  test("normalizes the root and every runtime directory to owner-only permissions", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "yaca-root-existing-mode-"));
+    temporaryRoots.push(parent);
+    const requestedRoot = join(parent, "data");
+    await mkdir(requestedRoot, { mode: 0o755 });
+    await mkdir(join(requestedRoot, "app"), { mode: 0o755 });
+    await chmod(requestedRoot, 0o755);
+    await chmod(join(requestedRoot, "app"), 0o755);
+
+    const paths = await prepareYacaPaths({ root: requestedRoot });
+
+    await expect(
+      Promise.all(Object.values(paths).map(async (path) => (await stat(path)).mode & 0o777)),
+    ).resolves.toEqual([0o700, 0o700, 0o700, 0o700, 0o700, 0o700, 0o700, 0o700]);
+  });
+
   test("rejects a yaca data root whose leaf is a symbolic link", async () => {
     const parent = await mkdtemp(join(tmpdir(), "yaca-root-link-"));
     temporaryRoots.push(parent);
@@ -64,6 +80,18 @@ describe("yaca persistence paths", () => {
       "yaca data root must not be a symbolic link",
     );
     expect(await readdir(target)).toEqual([]);
+  });
+
+  test("rejects the default .yaca leaf when it is a symbolic link", async () => {
+    const home = await mkdtemp(join(tmpdir(), "yaca-home-link-"));
+    temporaryRoots.push(home);
+    const target = join(home, "redirected-data");
+    await mkdir(target);
+    await symlink(target, join(home, ".yaca"), "dir");
+
+    await expect(prepareYacaPaths({ home })).rejects.toThrow(
+      "yaca data root must not be a symbolic link",
+    );
   });
 
   test("rejects a derived directory symlink that escapes the canonical root", async () => {
