@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open, realpath } from "node:fs/promises";
+import { chmod, mkdir, open, realpath } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import { PersistenceError, persistenceError } from "./errors.js";
 import {
@@ -27,8 +27,9 @@ export type DurableJsonlStatus = "healthy" | "degraded";
 export class DurableJsonl<T> {
   readonly #requestedPath: string;
   readonly #options: PersistenceOptions<T>;
+  #degradedResult: JsonlReadResult<T> | undefined;
   #inspected = false;
-  #pending: Promise<void> = Promise.resolve();
+  #queue: Promise<void> = Promise.resolve();
   #status: DurableJsonlStatus = "healthy";
 
   constructor(path: string, options: PersistenceOptions<T> = {}) {
@@ -44,26 +45,25 @@ export class DurableJsonl<T> {
     if (this.#status === "degraded") {
       return Promise.reject(new PersistenceError("degraded"));
     }
-    const operation = this.#pending.then(() => {
+    return this.#enqueue(() => {
       if (this.#status === "degraded") throw new PersistenceError("degraded");
       return this.#append(value);
     });
-    this.#pending = operation.catch(() => undefined);
-    return operation;
   }
 
-  async readValidPrefix(): Promise<JsonlReadResult<T>> {
-    await this.#pending;
-    return this.#readValidPrefix();
+  readValidPrefix(): Promise<JsonlReadResult<T>> {
+    return this.#enqueue(() => this.#readValidPrefix());
   }
 
   async #readValidPrefix(): Promise<JsonlReadResult<T>> {
+    if (this.#degradedResult) return this.#degradedResult;
     const target = await resolveTarget(this.#requestedPath);
     let handle;
     let bytes: Buffer;
     try {
       handle = await open(target.path, constants.O_RDONLY | constants.O_NOFOLLOW);
       await handle.chmod(0o600);
+      await injectFault(this.#options.faultInjector, "read");
       bytes = await handle.readFile();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -95,9 +95,20 @@ export class DurableJsonl<T> {
     const quarantinedTail = await this.#quarantine(
       target.directory,
       target.path,
+      bytes,
       bytes.subarray(offset),
     );
-    return { records, quarantinedTail };
+    this.#degradedResult = { records, quarantinedTail };
+    return this.#degradedResult;
+  }
+
+  #enqueue<R>(operation: () => Promise<R>): Promise<R> {
+    const result = this.#queue.then(operation);
+    this.#queue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   async #append(value: T): Promise<void> {
@@ -134,29 +145,45 @@ export class DurableJsonl<T> {
   async #quarantine(
     sourceDirectory: string,
     sourcePath: string,
+    source: Buffer,
     tail: Buffer,
   ): Promise<QuarantinedJsonlTail> {
     try {
       const requestedDirectory = join(sourceDirectory, `${basename(sourcePath)}.quarantine`);
       await mkdir(requestedDirectory, { mode: 0o700, recursive: true });
       const quarantineDirectory = await realpath(requestedDirectory);
+      await chmod(quarantineDirectory, 0o700);
       const relation = relative(sourceDirectory, quarantineDirectory);
       if (relation.startsWith("..") || relation === "" || relation.startsWith("/")) {
         throw new PersistenceError("unsafe_symbolic_link");
       }
-      const quarantinePath = join(quarantineDirectory, `tail-${randomUUID()}.jsonl`);
-      const handle = await open(
-        quarantinePath,
-        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
-        0o600,
-      );
+      const fingerprint = createHash("sha256").update(source).digest("hex");
+      const quarantinePath = join(quarantineDirectory, `tail-${fingerprint}.jsonl`);
+      let handle;
       try {
+        handle = await open(
+          quarantinePath,
+          constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+          0o600,
+        );
         await handle.writeFile(tail);
         await handle.sync();
-      } finally {
         await handle.close();
+        handle = undefined;
+        await syncDirectory(quarantineDirectory);
+      } catch (error) {
+        await handle?.close();
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const existing = await open(quarantinePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          await existing.chmod(0o600);
+          if (!(await existing.readFile()).equals(tail)) {
+            throw new PersistenceError("io_failure");
+          }
+        } finally {
+          await existing.close();
+        }
       }
-      await syncDirectory(quarantineDirectory);
       return { path: quarantinePath, byteLength: tail.byteLength };
     } catch (error) {
       throw persistenceError(error);

@@ -33,6 +33,18 @@ function failAt(target: PersistenceOperation): (operation: PersistenceOperation)
   };
 }
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
+function nextTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 describe("AtomicJsonFile", () => {
   test("durably replaces JSON and reconstructs the value", async () => {
     const directory = await temporaryDirectory("yaca-atomic-json-");
@@ -119,6 +131,96 @@ describe("DurableJsonl", () => {
       quarantinedTail: null,
     });
     expect((await lstat(target)).mode & 0o777).toBe(0o600);
+  });
+
+  test("does not begin an append until an earlier read reaches its linearization point", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-read-barrier-");
+    const target = join(directory, "events.jsonl");
+    await writeFile(target, '{"sequence":0}\n', { mode: 0o600 });
+    const readEntered = deferred();
+    const releaseRead = deferred();
+    let blockedFirstRead = false;
+    let writeEntered = false;
+    const ledger = new DurableJsonl<{ sequence: number }>(target, {
+      faultInjector: async (operation) => {
+        if (operation === "read" && !blockedFirstRead) {
+          blockedFirstRead = true;
+          readEntered.resolve();
+          await releaseRead.promise;
+        }
+        if (operation === "write") writeEntered = true;
+      },
+    });
+
+    const reading = ledger.readValidPrefix();
+    await readEntered.promise;
+    const appending = ledger.append({ sequence: 1 });
+    await nextTurn();
+
+    expect(writeEntered).toBe(false);
+    releaseRead.resolve();
+    await expect(reading).resolves.toMatchObject({ records: [{ sequence: 0 }] });
+    await expect(appending).resolves.toBeUndefined();
+    expect(writeEntered).toBe(true);
+  });
+
+  test("does not expose or quarantine a written line before its fsync completes", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-fsync-barrier-");
+    const target = join(directory, "events.jsonl");
+    const fsyncEntered = deferred();
+    const releaseFsync = deferred();
+    let blockFirstFsync = true;
+    const ledger = new DurableJsonl<{ sequence: number }>(target, {
+      faultInjector: async (operation) => {
+        if (operation === "file-fsync" && blockFirstFsync) {
+          blockFirstFsync = false;
+          fsyncEntered.resolve();
+          await releaseFsync.promise;
+        }
+      },
+    });
+
+    const appending = ledger.append({ sequence: 1 });
+    await fsyncEntered.promise;
+    let readSettled = false;
+    const reading = ledger.readValidPrefix().then((result) => {
+      readSettled = true;
+      return result;
+    });
+    await nextTurn();
+
+    expect(readSettled).toBe(false);
+    releaseFsync.resolve();
+    await expect(appending).resolves.toBeUndefined();
+    await expect(reading).resolves.toEqual({
+      records: [{ sequence: 1 }],
+      quarantinedTail: null,
+    });
+    await expect(readdir(join(directory, "events.jsonl.quarantine"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  test("linearizes 32 interleaved appends and reads in call order", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-linearized-race-");
+    const target = join(directory, "events.jsonl");
+    const ledger = new DurableJsonl<{ sequence: number }>(target);
+    const operations: Array<Promise<unknown>> = [];
+
+    for (let sequence = 0; sequence < 32; sequence += 1) {
+      operations.push(ledger.append({ sequence }));
+      operations.push(
+        ledger.readValidPrefix().then((result) => {
+          expect(result.records).toEqual(
+            Array.from({ length: sequence + 1 }, (_, current) => ({ sequence: current })),
+          );
+          expect(result.quarantinedTail).toBeNull();
+        }),
+      );
+    }
+
+    await Promise.all(operations);
+    expect(ledger.status).toBe("healthy");
   });
 
   test.each([
@@ -208,11 +310,34 @@ describe("DurableJsonl", () => {
       await expect(ledger.append({ sequence: 3 })).rejects.toMatchObject({ code: "degraded" });
 
       const second = await ledger.readValidPrefix();
-      expect(second.quarantinedTail?.path).not.toBe(first.quarantinedTail?.path);
+      const reopened = await new DurableJsonl<{ sequence: number }>(target).readValidPrefix();
+
+      expect(second.quarantinedTail?.path).toBe(first.quarantinedTail?.path);
+      expect(reopened.quarantinedTail?.path).toBe(first.quarantinedTail?.path);
+      expect(await readdir(join(directory, "events.jsonl.quarantine"))).toHaveLength(1);
       await expect(readFile(first.quarantinedTail!.path)).resolves.toEqual(tail);
       await expect(readFile(target)).resolves.toEqual(original);
     },
   );
+
+  test("does not overwrite or reuse mismatched quarantine evidence", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-quarantine-conflict-");
+    const target = join(directory, "events.jsonl");
+    const original = Buffer.from('{"sequence":1}\n{"sequence":');
+    await writeFile(target, original, { mode: 0o600 });
+    const first = await new DurableJsonl<{ sequence: number }>(target).readValidPrefix();
+    const quarantinePath = first.quarantinedTail!.path;
+    const mismatchedEvidence = Buffer.from("mismatched quarantine evidence");
+    await writeFile(quarantinePath, mismatchedEvidence);
+    const reopened = new DurableJsonl<{ sequence: number }>(target);
+
+    await expect(reopened.readValidPrefix()).rejects.toMatchObject({ code: "io_failure" });
+
+    expect(reopened.status).toBe("degraded");
+    await expect(readFile(quarantinePath)).resolves.toEqual(mismatchedEvidence);
+    await expect(readFile(target)).resolves.toEqual(original);
+    expect(await readdir(join(directory, "events.jsonl.quarantine"))).toHaveLength(1);
+  });
 
   test("reopens an existing partial tail as degraded before any append", async () => {
     const directory = await temporaryDirectory("yaca-jsonl-reopen-tail-");
