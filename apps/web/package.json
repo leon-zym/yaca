@@ -5,6 +5,7 @@
   "scripts": {
     "build": "tsc --noEmit -p tsconfig.json && vite build",
     "dev": "vite --host 127.0.0.1",
+    "pretest": "pnpm --filter @yaca/contracts build",
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
