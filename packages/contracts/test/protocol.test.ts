@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 import { describe, expect, it } from "vitest";
 import type { TSchema } from "typebox";
@@ -31,6 +32,8 @@ import {
   HealthResponseSchema,
   MUTATION_AUTHORITY,
   MUTATION_COMMAND_TYPES,
+  type MutationAuthorityDescriptor,
+  type MutationCommandType,
   JsonValueSchema,
   RunEnvelopeSchema,
   RunPromptPayloadSchema,
@@ -49,6 +52,98 @@ const fixtureDirectory = fileURLToPath(new URL("../../../docs/spec/fixtures/", i
 
 function fixture(name: string): Record<string, unknown> {
   return JSON.parse(readFileSync(`${fixtureDirectory}${name}`, "utf8")) as Record<string, unknown>;
+}
+
+const EXPECTED_MUTATION_AUTHORITY = {
+  "app.setThemePreference": { scope: "host", authority: "app", lineage: "none" },
+  "workspace.register": { scope: "host", authority: "workspace-catalog", lineage: "none" },
+  "workspace.select": { scope: "host", authority: "selection", lineage: "none" },
+  "workspace.updateDisplayName": {
+    scope: "workspace",
+    authority: "payload.workspaceId",
+    lineage: "workspace",
+  },
+  "workspace.remove": {
+    scope: "workspace",
+    authority: "payload.workspaceId",
+    lineage: "workspace",
+  },
+  "session.create": {
+    scope: "workspace",
+    authority: "payload.workspaceId",
+    lineage: "workspace",
+  },
+  "session.activate": {
+    scope: "session",
+    authority: "envelope.sessionId",
+    lineage: "workspace/session",
+  },
+  "session.rename": {
+    scope: "session",
+    authority: "envelope.sessionId",
+    lineage: "workspace/session",
+  },
+  "session.trash": {
+    scope: "session",
+    authority: "envelope.sessionId",
+    lineage: "workspace/session",
+  },
+  "session.trash.restore": {
+    scope: "workspace",
+    authority: "trash.workspaceId",
+    lineage: "workspace",
+  },
+  "run.prompt": {
+    scope: "run",
+    authority: "allocated.runId",
+    lineage: "workspace/session/run/product-turn",
+  },
+  "run.abort": {
+    scope: "run",
+    authority: "payload.runId",
+    lineage: "workspace/session/run",
+  },
+  "command.acknowledgeUnknown": { scope: "host", authority: "app", lineage: "none" },
+  "runtime.setDesiredModel": {
+    scope: "session",
+    authority: "envelope.sessionId",
+    lineage: "workspace/session",
+  },
+  "runtime.setDesiredThinking": {
+    scope: "session",
+    authority: "envelope.sessionId",
+    lineage: "workspace/session",
+  },
+} as const satisfies Record<MutationCommandType, MutationAuthorityDescriptor>;
+
+function toolGoldenMatches(scenario: Record<string, unknown>): boolean {
+  const events = scenario.events as Array<Record<string, unknown>>;
+  const oracle = scenario.expect as Record<string, unknown>;
+  const initialPayload = events.find((event) => event.type === "tool.declaration_started")
+    ?.payload as Record<string, unknown> | undefined;
+  const finalPayload = events.find((event) => event.type === "tool.declaration_settled")
+    ?.payload as Record<string, unknown> | undefined;
+  if (initialPayload === undefined || finalPayload === undefined) return false;
+  const initialBlock = initialPayload.block as Record<string, unknown>;
+  const finalBlock = finalPayload.block as Record<string, unknown>;
+  const initialTool = initialBlock.tool as Record<string, unknown>;
+  const expectedKeys = [
+    "executionMaySettleOutOfOrder",
+    "finalToolBlock",
+    "initialToolBlock",
+    "targetBlockId",
+    "toolCallId",
+  ];
+  return (
+    isDeepStrictEqual(Object.keys(oracle).sort(), expectedKeys) &&
+    Value.Check(ToolDeclarationStartedPayloadSchema, initialPayload) &&
+    Value.Check(ToolDeclarationSettledPayloadSchema, finalPayload) &&
+    isDeepStrictEqual(oracle.initialToolBlock, initialBlock) &&
+    isDeepStrictEqual(oracle.finalToolBlock, finalBlock) &&
+    oracle.targetBlockId === initialBlock.blockId &&
+    oracle.toolCallId === initialTool.toolCallId &&
+    oracle.executionMaySettleOutOfOrder === true
+  );
 }
 
 function assertMaximumBoundaries(
@@ -195,6 +290,15 @@ describe("closed application protocol", () => {
     expect(Object.keys(EVENT_ENVELOPE_SCHEMAS).sort()).toEqual([...EVENT_TYPES].sort());
   });
 
+  it("matches every mutation to the explicit protocol authority oracle", () => {
+    expect(MUTATION_AUTHORITY).toEqual(EXPECTED_MUTATION_AUTHORITY);
+    expect(MUTATION_AUTHORITY["run.prompt"]).toEqual({
+      scope: "run",
+      authority: "allocated.runId",
+      lineage: "workspace/session/run/product-turn",
+    });
+  });
+
   it("keeps every wire object closed except intentional JsonValue records", () => {
     const visited = new Set<object>();
     const visit = (schema: unknown): void => {
@@ -279,6 +383,23 @@ describe("closed application protocol", () => {
       else (block.tool as Record<string, unknown>)[field] = value;
       expect(Value.Check(ToolDeclarationStartedPayloadSchema, invalid), field).toBe(false);
     }
+  });
+
+  it("deeply matches the tool golden oracle and rejects oracle drift", () => {
+    const scenario = fixture("tool-declaration-stream.json");
+    expect(toolGoldenMatches(scenario)).toBe(true);
+
+    const unknown = structuredClone(scenario);
+    (unknown.expect as Record<string, unknown>).unknown = true;
+    expect(toolGoldenMatches(unknown)).toBe(false);
+
+    const changed = structuredClone(scenario);
+    const expectedFinal = (changed.expect as Record<string, unknown>).finalToolBlock as Record<
+      string,
+      unknown
+    >;
+    (expectedFinal.tool as Record<string, unknown>).summary = "changed";
+    expect(toolGoldenMatches(changed)).toBe(false);
   });
 
   it("classifies client and server codec failures without exception leakage", () => {
