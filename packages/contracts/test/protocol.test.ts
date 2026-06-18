@@ -31,6 +31,7 @@ import {
   HealthResponseSchema,
   MUTATION_AUTHORITY,
   MUTATION_COMMAND_TYPES,
+  JsonValueSchema,
   RunEnvelopeSchema,
   RunPromptPayloadSchema,
   SessionCatalogPageRequestSchema,
@@ -519,5 +520,21 @@ describe("closed application protocol", () => {
     expect(Value.Check(DisplayNameSchema, "允许 Unicode")).toBe(true);
     expect(Value.Check(DisplayNameSchema, "reject\u0085control")).toBe(false);
     expect(Value.Check(RunPromptPayloadSchema, {})).toBe(false);
+  });
+
+  it("enforces aggregate JsonValue serialization and nesting boundaries", () => {
+    const encoder = new TextEncoder();
+    const values = Array.from({ length: 5 }, (_, index) => (index < 4 ? "x".repeat(52_000) : ""));
+    const remaining = 262_144 - encoder.encode(JSON.stringify(values)).byteLength;
+    values[4] = "x".repeat(remaining);
+    expect(encoder.encode(JSON.stringify(values)).byteLength).toBe(262_144);
+    expect(Value.Check(JsonValueSchema, values)).toBe(true);
+    values[4] += "x";
+    expect(Value.Check(JsonValueSchema, values)).toBe(false);
+
+    let depth32: unknown = null;
+    for (let depth = 0; depth < 32; depth += 1) depth32 = [depth32];
+    expect(Value.Check(JsonValueSchema, depth32)).toBe(true);
+    expect(Value.Check(JsonValueSchema, [depth32])).toBe(false);
   });
 });

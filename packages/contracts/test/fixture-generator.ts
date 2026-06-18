@@ -106,8 +106,12 @@ function maximumString(
   if (maximumStringCache.has(schema)) return maximumStringCache.get(schema) ?? null;
   const node = schema as { format?: unknown; maxLength?: unknown };
   if (node.format !== undefined) {
-    maximumStringCache.set(schema, null);
-    return null;
+    const valid = `1970-01-01T00:00:00.${"1".repeat(17)}Z`;
+    const invalid = `1970-01-01T00:00:00.${"1".repeat(18)}Z`;
+    const result =
+      Value.Check(schema, valid) && !Value.Check(schema, invalid) ? { valid, invalid } : null;
+    maximumStringCache.set(schema, result);
+    return result;
   }
   const character = minimum[0] ?? "x";
   let low = minimum.length;
