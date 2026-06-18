@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
+import type { TSchema } from "typebox";
 
 import {
   ApplicationFrameSchema,
@@ -27,6 +28,7 @@ import {
   EVENT_PAYLOAD_SCHEMAS,
   EVENT_TYPES,
   HelloSchema,
+  HealthResponseSchema,
   MUTATION_AUTHORITY,
   MUTATION_COMMAND_TYPES,
   RunEnvelopeSchema,
@@ -40,11 +42,29 @@ import {
   Value,
   WelcomeSchema,
 } from "../src/index.js";
+import { createBoundaryFixtures, createMinimumFixture } from "./fixture-generator.js";
 
 const fixtureDirectory = fileURLToPath(new URL("../../../docs/spec/fixtures/", import.meta.url));
 
 function fixture(name: string): Record<string, unknown> {
   return JSON.parse(readFileSync(`${fixtureDirectory}${name}`, "utf8")) as Record<string, unknown>;
+}
+
+function assertMaximumBoundaries(
+  registry: Record<string, TSchema>,
+  encode: (value: unknown) => { readonly ok: boolean },
+): void {
+  for (const [name, schema] of Object.entries(registry)) {
+    const boundaries = createBoundaryFixtures(schema);
+    expect(boundaries.length, `${name} boundaries`).toBeGreaterThan(0);
+    for (const boundary of boundaries) {
+      expect(Value.Check(schema, boundary.valid), `${name}:${boundary.path} maximum`).toBe(true);
+      expect(Value.Check(schema, boundary.invalid), `${name}:${boundary.path} overflow`).toBe(
+        false,
+      );
+      expect(encode(boundary.valid).ok, `${name}:${boundary.path} maximum encode`).toBe(true);
+    }
+  }
 }
 
 describe("closed application protocol", () => {
@@ -188,11 +208,29 @@ describe("closed application protocol", () => {
     visit(ApplicationFrameSchema);
   });
 
+  it("publishes no Value.Create defaults in wire schemas", () => {
+    const visited = new Set<object>();
+    const visit = (schema: unknown): void => {
+      if (schema === null || typeof schema !== "object" || visited.has(schema)) return;
+      visited.add(schema);
+      const node = schema as Record<string, unknown>;
+      expect(Object.hasOwn(node, "default")).toBe(false);
+      for (const value of Object.values(node)) visit(value);
+    };
+    visit(ApplicationFrameSchema);
+    visit(HealthResponseSchema);
+  });
+
   it("generates a minimum valid and unknown-field-invalid fixture for every payload/result variant", () => {
     const registries = [COMMAND_PAYLOAD_SCHEMAS, COMMAND_RESULT_SCHEMAS, EVENT_PAYLOAD_SCHEMAS];
     for (const registry of registries) {
       for (const [name, schema] of Object.entries(registry)) {
-        const minimum = Value.Create(schema);
+        let minimum: unknown;
+        try {
+          minimum = createMinimumFixture(schema);
+        } catch (error) {
+          throw new Error(`${name}: ${String(error)}`);
+        }
         expect(Value.Check(schema, minimum), `${name} minimum`).toBe(true);
         expect(
           Value.Check(schema, { ...(minimum as Record<string, unknown>), unknown: true }),
@@ -304,9 +342,38 @@ describe("closed application protocol", () => {
     expect(unknownEncode.ok ? "ok" : unknownEncode.error.code).toBe("unsupported_command");
   });
 
+  it("uses only shallow numeric protocol-major probes before v1 validation", () => {
+    const clientCases = [
+      { type: "hello", protocolMajor: 2, future: { deeply: "unknown" } },
+      { requestId: "future-request", type: "future.command", protocolMajor: 2 },
+    ];
+    for (const value of clientCases) {
+      const result = decodeClientFrame(JSON.stringify(value));
+      expect(result.ok ? "ok" : result.error.code).toBe("unsupported_protocol");
+    }
+    const welcome = decodeServerFrame(
+      JSON.stringify({ type: "welcome", protocolMajor: 9, future: true }),
+    );
+    expect(welcome.ok ? "ok" : welcome.error.code).toBe("unsupported_protocol");
+    for (const value of [
+      { type: "hello", protocolMajor: "2" },
+      { type: "hello", future: { protocolMajor: 2 } },
+      { protocolMajor: 2 },
+      ["hello", 2],
+    ]) {
+      const result = decodeClientFrame(JSON.stringify(value));
+      expect(result.ok ? "ok" : result.error.code).toBe("invalid_frame");
+    }
+  });
+
   it("round-trips every command, response, and event envelope by frame direction", () => {
     for (const [name, schema] of Object.entries(COMMAND_ENVELOPE_SCHEMAS)) {
-      const value = Value.Create(schema);
+      let value: unknown;
+      try {
+        value = createMinimumFixture(schema);
+      } catch (error) {
+        throw new Error(`${name}: ${String(error)}`);
+      }
       const encoded = encodeClientFrame(value);
       expect(encoded.ok, `${name} client encode`).toBe(true);
       if (encoded.ok)
@@ -324,7 +391,7 @@ describe("closed application protocol", () => {
     }
     for (const registries of [COMMAND_RESPONSE_SCHEMAS, EVENT_ENVELOPE_SCHEMAS]) {
       for (const [name, schema] of Object.entries(registries)) {
-        const value = Value.Create(schema);
+        const value = createMinimumFixture(schema);
         const encoded = encodeServerFrame(value);
         expect(encoded.ok, `${name} server encode`).toBe(true);
         if (encoded.ok)
@@ -342,6 +409,18 @@ describe("closed application protocol", () => {
       }
     }
   });
+
+  it("covers maximum boundaries for all 24 command envelopes", () => {
+    assertMaximumBoundaries(COMMAND_ENVELOPE_SCHEMAS, encodeClientFrame);
+  }, 10_000);
+
+  it("covers maximum boundaries for all 24 success response envelopes", () => {
+    assertMaximumBoundaries(COMMAND_RESPONSE_SCHEMAS, encodeServerFrame);
+  }, 20_000);
+
+  it("covers maximum boundaries for all 20 event envelopes", () => {
+    assertMaximumBoundaries(EVENT_ENVELOPE_SCHEMAS, encodeServerFrame);
+  }, 15_000);
 
   it("returns stable AppError values from codecs instead of leaking throws", () => {
     const decoded = decodeApplicationFrame("{not-json");
@@ -399,14 +478,20 @@ describe("closed application protocol", () => {
   });
 
   it("accepts exact UTF-8 boundaries and rejects one byte beyond them", () => {
-    expect(Value.Check(RunPromptPayloadSchema, { text: "x".repeat(262_144) })).toBe(true);
-    expect(Value.Check(RunPromptPayloadSchema, { text: "x".repeat(262_145) })).toBe(false);
+    expect(Value.Check(RunPromptPayloadSchema, { text: "x".repeat(262_142) })).toBe(true);
+    expect(Value.Check(RunPromptPayloadSchema, { text: "x".repeat(262_143) })).toBe(false);
+    expect(Value.Check(RunPromptPayloadSchema, { text: "\n".repeat(131_071) })).toBe(true);
+    expect(Value.Check(RunPromptPayloadSchema, { text: "\n".repeat(131_072) })).toBe(false);
+    for (const escaped of ['"', "\\"]) {
+      expect(Value.Check(RunPromptPayloadSchema, { text: escaped.repeat(131_071) })).toBe(true);
+      expect(Value.Check(RunPromptPayloadSchema, { text: escaped.repeat(131_072) })).toBe(false);
+    }
     expect(
       Value.Check(BlockDeltaPayloadSchema, {
         productTurnId: "turn",
         stepId: "step",
         blockId: "block",
-        append: `${"界".repeat(10_922)}xx`,
+        append: `${"界".repeat(10_922)}`,
       }),
     ).toBe(true);
     expect(
@@ -414,23 +499,25 @@ describe("closed application protocol", () => {
         productTurnId: "turn",
         stepId: "step",
         blockId: "block",
-        append: `${"界".repeat(10_922)}xxx`,
+        append: `${"界".repeat(10_922)}x`,
       }),
     ).toBe(false);
     const preview = {
-      text: "x".repeat(65_536),
+      text: "x".repeat(65_534),
       truncated: false,
       originalByteLength: "65536",
       complete: null,
     };
     expect(Value.Check(ContentPreviewSchema, preview)).toBe(true);
     expect(Value.Check(ContentPreviewSchema, { ...preview, text: `${preview.text}x` })).toBe(false);
-    const cursorAtLimit = `${"界".repeat(170)}xx`;
+    const cursorAtLimit = `${"界".repeat(170)}`;
     expect(Value.Check(CursorSchema, cursorAtLimit)).toBe(true);
     expect(Value.Check(CursorSchema, `${cursorAtLimit}x`)).toBe(false);
-    const nameAtLimit = `${"界".repeat(42)}xx`;
+    const nameAtLimit = `${"界".repeat(42)}`;
     expect(Value.Check(DisplayNameSchema, nameAtLimit)).toBe(true);
     expect(Value.Check(DisplayNameSchema, `${nameAtLimit}x`)).toBe(false);
+    expect(Value.Check(DisplayNameSchema, "允许 Unicode")).toBe(true);
+    expect(Value.Check(DisplayNameSchema, "reject\u0085control")).toBe(false);
     expect(Value.Check(RunPromptPayloadSchema, {})).toBe(false);
   });
 });

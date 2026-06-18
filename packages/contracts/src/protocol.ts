@@ -5,15 +5,16 @@ const closed = <const P extends TProperties>(properties: P) =>
   Type.Object(properties, { additionalProperties: false });
 const nullable = <T extends TSchema>(schema: T) => Type.Union([schema, Type.Null()]);
 const utf8Length = (value: string) => new TextEncoder().encode(value).byteLength;
+const serializedStringByteLength = (value: string) => utf8Length(JSON.stringify(value));
 const utf8String = (maximum: number, minimum = 0) =>
+  Type.Refine(Type.String(), (value) => {
+    const scalarLength = [...value].length;
+    return scalarLength >= minimum && serializedStringByteLength(value) <= maximum;
+  });
+const utf8Pattern = (maximum: number, minimum: number, pattern: string) =>
   Type.Refine(
-    Type.String({ default: "x".repeat(minimum) }),
-    (value) => utf8Length(value) >= minimum && utf8Length(value) <= maximum,
-  );
-const utf8Pattern = (maximum: number, minimum: number, pattern: string, defaultValue: string) =>
-  Type.Refine(
-    Type.String({ pattern, default: defaultValue }),
-    (value) => utf8Length(value) >= minimum && utf8Length(value) <= maximum,
+    Type.String({ pattern }),
+    (value) => [...value].length >= minimum && serializedStringByteLength(value) <= maximum,
   );
 const trimmed = (maximum: number) =>
   Type.Refine(
@@ -22,24 +23,24 @@ const trimmed = (maximum: number) =>
       value === value.trim() &&
       ![...value].some((character) => {
         const codePoint = character.codePointAt(0) ?? 0;
-        return codePoint <= 31 || codePoint === 127;
+        return codePoint <= 31 || (codePoint >= 127 && codePoint <= 159);
       }),
   );
 
 export const FRAME_BYTE_LIMIT = 1_048_576;
-export const OpaqueIdSchema = utf8Pattern(128, 1, "^[A-Za-z0-9_-]+$", "x");
+export const OpaqueIdSchema = utf8Pattern(128, 1, "^[A-Za-z0-9_-]+$");
 export const RequestIdSchema = OpaqueIdSchema;
 export const MutationIdSchema = OpaqueIdSchema;
 export const SessionVersionSchema = OpaqueIdSchema;
 export const RuntimeEpochSchema = OpaqueIdSchema;
 export const CursorSchema = utf8String(512, 1);
 export const IsoInstantSchema = Type.Refine(
-  Type.String({ format: "date-time", default: "1970-01-01T00:00:00.000Z" }),
-  (value) => utf8Length(value) <= 40 && value.endsWith("Z"),
+  Type.String({ format: "date-time" }),
+  (value) => serializedStringByteLength(value) <= 40 && value.endsWith("Z"),
 );
 export const DisplayNameSchema = trimmed(128);
 export const SessionTitleSchema = trimmed(200);
-export const LocalPathInputSchema = utf8Pattern(4096, 1, "^[^\\u0000]+$", ".");
+export const LocalPathInputSchema = utf8Pattern(4096, 1, "^[^\\u0000]+$");
 export const DisplayPathSchema = LocalPathInputSchema;
 export const SafeTextSchema = utf8String(65_536);
 export const SequenceSchema = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
@@ -48,7 +49,6 @@ export const ByteCountSchema = Type.String({
   minLength: 1,
   maxLength: 32,
   pattern: "^[0-9]+$",
-  default: "0",
 });
 
 export const ThemePreferenceSchema = Type.Enum(["system", "light", "dark"]);
@@ -225,7 +225,6 @@ export const ModelCatalogEntrySchema = closed({
     minItems: 1,
     maxItems: 7,
     uniqueItems: true,
-    default: ["off"],
   }),
 });
 export const ModelCatalogSchema = closed({
@@ -321,7 +320,7 @@ export const ContentReferenceSchema = closed({
   kind: Type.Enum(["text", "terminal", "diff", "json", "binary"]),
   mediaType: utf8String(200, 1),
   byteLength: ByteCountSchema,
-  digest: utf8String(64, 64),
+  digest: Type.String({ minLength: 64, maxLength: 64 }),
   available: Type.Boolean(),
 });
 export const ContentPreviewSchema = closed({
@@ -344,7 +343,6 @@ const JsonValueBaseSchema = Type.Cyclic(
     ]),
   },
   "JsonValue",
-  { default: {} },
 );
 function jsonWithinLimits(value: unknown): boolean {
   const visit = (node: unknown, depth: number): boolean => {
@@ -356,7 +354,8 @@ function jsonWithinLimits(value: unknown): boolean {
       return (
         entries.length <= 1024 &&
         entries.every(
-          ([key, item]) => utf8Length(key) >= 1 && utf8Length(key) <= 256 && visit(item, depth + 1),
+          ([key, item]) =>
+            key.length >= 1 && serializedStringByteLength(key) <= 256 && visit(item, depth + 1),
         )
       );
     }
@@ -441,7 +440,7 @@ const toolFields = {
   argumentsTruncated: Type.Boolean(),
   argumentsContent: nullable(ContentReferenceSchema),
   executionStatus: ToolExecutionStatusSchema,
-  summary: Type.Refine(Type.String({ default: "x" }), (value) => utf8Length(value) <= 1000),
+  summary: utf8String(1000),
   details: nullable(ToolDetailsSchema),
   startedAt: nullable(IsoInstantSchema),
   terminalAt: nullable(IsoInstantSchema),
@@ -513,7 +512,6 @@ export const SessionSyncViewSchema = closed({
   mutationBlockedByReceiptIds: Type.Array(OpaqueIdSchema, {
     maxItems: 200,
     uniqueItems: true,
-    default: [],
   }),
 });
 export const DegradedViewSchema = closed({
@@ -1094,16 +1092,14 @@ export const BlockSettledPayloadSchema = closed({
 const PreparingToolCallSchema = closed({
   toolCallId: OpaqueIdSchema,
   name: utf8String(256, 1),
-  toolKind: Type.Enum(["read", "edit", "write", "bash", "unknown"], {
-    default: "unknown",
-  }),
+  toolKind: Type.Enum(["read", "edit", "write", "bash", "unknown"]),
   declarationStatus: Type.Literal("preparing"),
   argumentsPreview: Type.Literal(""),
   argumentsTruncated: Type.Literal(false),
   arguments: Type.Null(),
   argumentsContent: Type.Null(),
   executionStatus: Type.Literal("pending"),
-  summary: Type.Refine(Type.String({ default: "x" }), (value) => utf8Length(value) <= 1000),
+  summary: utf8String(1000),
   details: Type.Null(),
   startedAt: IsoInstantSchema,
   terminalAt: Type.Null(),
@@ -1464,7 +1460,6 @@ export const HelloSchema = closed({
   capabilities: Type.Array(utf8String(128, 1), {
     maxItems: 128,
     uniqueItems: true,
-    default: [],
   }),
 });
 export const WelcomeSchema = closed({
@@ -1476,7 +1471,6 @@ export const WelcomeSchema = closed({
   capabilities: Type.Array(utf8String(128, 1), {
     maxItems: 128,
     uniqueItems: true,
-    default: [],
   }),
   connectionSeq: SequenceSchema,
 });
@@ -1540,22 +1534,6 @@ const protocolViolation = (): CodecResult<never> => ({
     retryDisposition: "never",
   },
 });
-const HelloVersionProbeSchema = closed({
-  type: Type.Literal("hello"),
-  protocolMajor: Type.Integer(),
-  protocolMinor: Type.Integer({ minimum: 0, maximum: 65535 }),
-  clientId: OpaqueIdSchema,
-  capabilities: Type.Array(utf8String(128, 1), { maxItems: 128, uniqueItems: true }),
-});
-const WelcomeVersionProbeSchema = closed({
-  type: Type.Literal("welcome"),
-  protocolMajor: Type.Integer(),
-  protocolMinor: Type.Integer({ minimum: 0, maximum: 65535 }),
-  connectionId: OpaqueIdSchema,
-  serverVersion: utf8String(128, 1),
-  capabilities: Type.Array(utf8String(128, 1), { maxItems: 128, uniqueItems: true }),
-  connectionSeq: SequenceSchema,
-});
 const CommandProbeSchema = closed({
   v: Type.Literal(1),
   requestId: RequestIdSchema,
@@ -1578,8 +1556,21 @@ function parseFrame(
     return malformed();
   }
 }
-function hasMajorMismatch(schema: TSchema, value: unknown): boolean {
-  return Value.Check(schema, value) && (value as { protocolMajor: number }).protocolMajor !== 1;
+function hasShallowMajorMismatch(value: unknown, direction: "client" | "server"): boolean {
+  try {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const record = value as Record<string, unknown>;
+    if (!Object.hasOwn(record, "protocolMajor")) return false;
+    const major = record.protocolMajor;
+    if (typeof major !== "number" || !Number.isFinite(major) || major === 1) return false;
+    if (direction === "server") return record.type === "welcome";
+    return (
+      record.type === "hello" ||
+      (typeof record.type === "string" && Object.hasOwn(record, "requestId"))
+    );
+  } catch {
+    return false;
+  }
 }
 function isUnknownCommand(value: unknown): boolean {
   return (
@@ -1624,7 +1615,7 @@ function serializeFrame(
 export function decodeClientFrame(serialized: string): CodecResult<ClientFrame> {
   const parsed = parseFrame(serialized, invalidFrame);
   if (!parsed.ok) return parsed;
-  if (hasMajorMismatch(HelloVersionProbeSchema, parsed.value)) return unsupportedProtocol();
+  if (hasShallowMajorMismatch(parsed.value, "client")) return unsupportedProtocol();
   if (isUnknownCommand(parsed.value)) return unsupportedCommand();
   return Value.Check(ClientFrameSchema, parsed.value)
     ? { ok: true, value: parsed.value }
@@ -1633,18 +1624,18 @@ export function decodeClientFrame(serialized: string): CodecResult<ClientFrame> 
 export function decodeServerFrame(serialized: string): CodecResult<ServerFrame> {
   const parsed = parseFrame(serialized, protocolViolation, protocolViolation);
   if (!parsed.ok) return parsed;
-  if (hasMajorMismatch(WelcomeVersionProbeSchema, parsed.value)) return unsupportedProtocol();
+  if (hasShallowMajorMismatch(parsed.value, "server")) return unsupportedProtocol();
   return Value.Check(ServerFrameSchema, parsed.value)
     ? { ok: true, value: parsed.value }
     : protocolViolation();
 }
 export function encodeClientFrame(value: unknown): CodecResult<string> {
-  if (hasMajorMismatch(HelloVersionProbeSchema, value)) return unsupportedProtocol();
+  if (hasShallowMajorMismatch(value, "client")) return unsupportedProtocol();
   if (isUnknownCommand(value)) return unsupportedCommand();
   return serializeFrame(ClientFrameSchema, value, invalidFrame);
 }
 export function encodeServerFrame(value: unknown): CodecResult<string> {
-  if (hasMajorMismatch(WelcomeVersionProbeSchema, value)) return unsupportedProtocol();
+  if (hasShallowMajorMismatch(value, "server")) return unsupportedProtocol();
   return serializeFrame(ServerFrameSchema, value, protocolViolation, protocolViolation);
 }
 
