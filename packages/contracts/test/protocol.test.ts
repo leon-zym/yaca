@@ -846,6 +846,16 @@ describe("closed application protocol", () => {
         ok: false,
         error: { code: "missing_authority_context", field: "workspaceId" },
       });
+      expect(
+        resolveCommandAuthority(byType(type).command, {
+          ...byType(type).context,
+          workspaceId: null,
+        } as unknown as CommandAuthorityContext),
+        `${type} null workspace`,
+      ).toEqual({
+        ok: false,
+        error: { code: "invalid_authority_identity", field: "workspaceId" },
+      });
       for (const workspaceId of ["", "not an opaque id"]) {
         expect(
           resolveCommandAuthority(byType(type).command, {
@@ -875,13 +885,18 @@ describe("closed application protocol", () => {
       error: { code: "missing_authority_context", field: "productTurnId" },
     });
     for (const [field, value] of [
+      ["runId", null],
       ["runId", ""],
       ["runId", "invalid run"],
+      ["productTurnId", null],
       ["productTurnId", ""],
       ["productTurnId", "invalid turn"],
     ] as const) {
       expect(
-        resolveCommandAuthority(prompt.command, { ...prompt.context, [field]: value }),
+        resolveCommandAuthority(prompt.command, {
+          ...prompt.context,
+          [field]: value,
+        } as unknown as CommandAuthorityContext),
         `run.prompt invalid ${field}`,
       ).toEqual({
         ok: false,

@@ -1098,6 +1098,22 @@ const invalidAuthorityContext = (
   error: { code: "invalid_authority_identity", field },
 });
 
+type RequiredAuthorityContext =
+  | { readonly ok: true; readonly value: string }
+  | { readonly ok: false; readonly error: CommandAuthorityResolution };
+
+const requireAuthorityContext = (
+  context: CommandAuthorityContext,
+  field: keyof CommandAuthorityContext,
+): RequiredAuthorityContext => {
+  const value: unknown = context[field];
+  if (value === undefined) return { ok: false, error: missingAuthorityContext(field) };
+  if (!Value.Check(OpaqueIdSchema, value)) {
+    return { ok: false, error: invalidAuthorityContext(field) };
+  }
+  return { ok: true, value };
+};
+
 const resolvedAuthority = (
   commandType: MutationCommandType,
   authorityId: string,
@@ -1159,55 +1175,58 @@ export function resolveCommandAuthority(
         null,
         null,
       );
-    case "session.trash.restore":
-      return context.workspaceId === undefined
-        ? missingAuthorityContext("workspaceId")
-        : resolvedAuthority(
-            command.type,
-            context.workspaceId,
-            context.workspaceId,
-            null,
-            null,
-            null,
-          );
+    case "session.trash.restore": {
+      const workspace = requireAuthorityContext(context, "workspaceId");
+      return workspace.ok
+        ? resolvedAuthority(command.type, workspace.value, workspace.value, null, null, null)
+        : workspace.error;
+    }
     case "session.activate":
     case "session.rename":
     case "session.trash":
     case "runtime.setDesiredModel":
-    case "runtime.setDesiredThinking":
-      return context.workspaceId === undefined
-        ? missingAuthorityContext("workspaceId")
-        : resolvedAuthority(
+    case "runtime.setDesiredThinking": {
+      const workspace = requireAuthorityContext(context, "workspaceId");
+      return workspace.ok
+        ? resolvedAuthority(
             command.type,
             command.sessionId,
-            context.workspaceId,
+            workspace.value,
             command.sessionId,
             null,
             null,
-          );
-    case "run.abort":
-      return context.workspaceId === undefined
-        ? missingAuthorityContext("workspaceId")
-        : resolvedAuthority(
+          )
+        : workspace.error;
+    }
+    case "run.abort": {
+      const workspace = requireAuthorityContext(context, "workspaceId");
+      return workspace.ok
+        ? resolvedAuthority(
             command.type,
             command.payload.runId,
-            context.workspaceId,
+            workspace.value,
             command.sessionId,
             command.payload.runId,
             null,
-          );
-    case "run.prompt":
-      if (context.workspaceId === undefined) return missingAuthorityContext("workspaceId");
-      if (context.runId === undefined) return missingAuthorityContext("runId");
-      if (context.productTurnId === undefined) return missingAuthorityContext("productTurnId");
+          )
+        : workspace.error;
+    }
+    case "run.prompt": {
+      const workspace = requireAuthorityContext(context, "workspaceId");
+      if (!workspace.ok) return workspace.error;
+      const run = requireAuthorityContext(context, "runId");
+      if (!run.ok) return run.error;
+      const productTurn = requireAuthorityContext(context, "productTurnId");
+      if (!productTurn.ok) return productTurn.error;
       return resolvedAuthority(
         command.type,
-        context.runId,
-        context.workspaceId,
+        run.value,
+        workspace.value,
         command.sessionId,
-        context.runId,
-        context.productTurnId,
+        run.value,
+        productTurn.value,
       );
+    }
     default: {
       const unsupported: never = command;
       return {
