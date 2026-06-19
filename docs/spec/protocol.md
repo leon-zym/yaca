@@ -840,7 +840,7 @@ Every mutation writes a scoped `recorded` intention first. A local mutation then
 
 Restart reconciliation order is normative:
 
-1. Parse the valid Command Ledger prefix. A corrupt tail is quarantined and affected Session mutations remain blocked.
+1. Parse the valid Command Ledger prefix through the serialized durable reader. The reader rejects a ledger larger than `268435456` bytes before allocating its content buffer. A corrupt tail leaves the ledger byte-for-byte unchanged, puts the Host in degraded mode, and blocks every mutation. The Host may retain logical Corrupt Tail Evidence—an opaque id, byte length, and read operation bound to the ledger identity and exact tail range—but never exposes a filesystem path or writes a quarantine directory, sidecar, or tail copy. Evidence reads are read-only and fail closed if the ledger path, identity, metadata, or bytes change.
 2. A valid local `committed`/`failed` record or combined Prompt terminal record wins.
 3. An accepted Prompt receipt/Run envelope without a terminal record becomes `outcome_unknown` with `interruptionReason: host_restart`; it is not rewritten to `interrupted`.
 4. Any recorded intent without a provable local commit, and a recorded Prompt without durable acceptance, becomes `delivery_unknown`.

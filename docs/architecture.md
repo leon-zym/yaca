@@ -151,6 +151,10 @@ Authority is divided by fact, not duplicated:
 | Complete oversized output | Content Store | Addressed by digest and scoped metadata |
 | Browser view | Host projection | Always replaceable by sync |
 
+The durable JSONL module is a deep module at the persistence seam: reads and appends share one linear queue, so a read observes only an fsync-complete prefix and cannot race an append. Before allocating a read buffer, it rejects a ledger larger than `268435456` bytes from file metadata. A corrupt tail permanently degrades that module instance and blocks every mutation; the original ledger remains byte-for-byte unchanged.
+
+Corruption produces logical **Corrupt Tail Evidence**, not a quarantine directory, sidecar, copied tail, or Content Reference. Its interface exposes only an opaque id, byte length, and bounded read operation—never a filesystem path. The evidence binds the canonical ledger's device, inode, owner, link count, mode, size, modification time, change time, valid-prefix offset, tail length, and tail SHA-256. Each evidence read opens the canonical ledger read-only with `O_NOFOLLOW`, reads only the captured range, and verifies descriptor and path identity again. Replacement, symlink or hard-link substitution, metadata or byte modification, and identity mismatch all fail closed. Detecting or reading corruption performs no filesystem write, including no create, copy, rename, truncate, chmod, or metadata repair. [ADR-0005](adr/0005-keep-corrupt-tail-evidence-logical.md) records why yaca rejected a physical quarantine sidecar.
+
 The Host does not maintain a durable copy of every realtime event. At settlement it reads the durable Session path again and replaces the Active Overlay with a Committed Snapshot. After restart it does the same without replaying transient deltas.
 
 Workspace registration stores a canonical realpath plus a user-editable display name. Registration validates that the path exists, is a directory, is readable, searchable, and writable, and is not already registered through another spelling or symlink. Display-name changes never rename or move the Workspace.
@@ -180,7 +184,7 @@ A duplicate mutation identifier returns its existing receipt and never invokes t
 1. A valid local committed/failed record or combined Prompt terminal journal record is authoritative.
 2. A durable accepted Prompt receipt plus Run envelope without a terminal record becomes `outcome_unknown` with a Host-restart interruption reason; it is never rewritten to `interrupted`. Session JSONL content may be displayed but cannot upgrade the outcome.
 3. Any recorded local intent without proven commit, and a recorded Prompt without durable acceptance, becomes `delivery_unknown`.
-4. A corrupt journal tail is quarantined; affected Sessions enter degraded mode and block new side-effecting mutations.
+4. A corrupt journal tail leaves the original ledger unchanged, exposes only logical Corrupt Tail Evidence, and puts the Host in degraded mode with every mutation blocked.
 5. Session JSONL is then reopened to rebuild committed content from the Run envelope's base identity.
 6. A new runtime projection epoch is created, and every old-epoch Active Overlay event is discarded.
 
@@ -192,7 +196,7 @@ Recovery behavior:
 - Sequence gap: stop applying deltas and request full application sync.
 - Host restart: reopen the Session, rebuild the Committed Snapshot, classify recorded Prompt as Unknown Delivery or accepted nonterminal Prompt as Outcome Unknown, attach a restart reason for UI explanation, and remain idle.
 - JSONL failure: preserve the source, expose the readable prefix if the public SDK permits it, and avoid writes until the user selects a safe recovery action.
-- Command Ledger tail damage: preserve the valid prefix, quarantine the unreadable tail, and classify each affected receipt as Unknown Delivery or Outcome Unknown from the last durable transition.
+- Command Ledger tail damage: preserve the ledger byte-for-byte, project the valid prefix, retain only logical Corrupt Tail Evidence for the unreadable range, block every mutation, and classify receipts as Unknown Delivery or Outcome Unknown from the last durable transition. A restart re-inspects the unchanged ledger and reconstructs evidence; it does not rely on a sidecar.
 
 ## Atomic sync and realtime ordering
 
@@ -318,6 +322,8 @@ The module interface is the test surface.
 
 - Duplicate identifiers, exhaustive mutation-to-authority mapping, local committed/failed paths, pre-record Prompt identity allocation, Prompt-only Run envelope linkage, delivery/outcome unknown separation, scope-aware acknowledgement, restart priority, truncated tails, and explicit new mutation receive deterministic tests.
 - A fault-injection test kills the Host at each durability boundary and proves it never automatically invokes the same mutation twice.
+- Persistence tests serialize reads with appends across the fsync barrier, reject ledgers above the `268435456`-byte safe-read ceiling before allocation, and prove corrupt-tail detection performs zero filesystem writes while the original ledger remains unchanged.
+- Corrupt Tail Evidence tests cover exact range recovery and fail-closed behavior for replacement, symlink, hard link, permission, owner, device/inode, link-count, size, timestamp, content-digest, and path-versus-descriptor identity changes.
 
 ### Recovery and browser paths
 
