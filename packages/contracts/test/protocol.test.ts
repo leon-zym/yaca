@@ -455,6 +455,49 @@ const MUTATION_AUTHORITY_CASES = [
   },
 ] as const satisfies readonly MutationAuthorityCase[];
 
+const EXPECTED_TOOL_DECLARATION_TRACE = [
+  {
+    type: "tool.declaration_started",
+    connectionSeq: 40,
+    runSeq: 1,
+    productTurnId: "turn-1",
+    stepId: "step-1",
+    blockId: "block-tool-1",
+    sourceIndex: 0,
+    toolCallId: "tool-call-1",
+  },
+  {
+    type: "tool.declaration_delta",
+    connectionSeq: 41,
+    runSeq: 2,
+    productTurnId: "turn-1",
+    stepId: "step-1",
+    blockId: "block-tool-1",
+    toolCallId: "tool-call-1",
+    argumentsFragment: '{"path":"',
+  },
+  {
+    type: "tool.declaration_delta",
+    connectionSeq: 42,
+    runSeq: 3,
+    productTurnId: "turn-1",
+    stepId: "step-1",
+    blockId: "block-tool-1",
+    toolCallId: "tool-call-1",
+    argumentsFragment: 'README.md"}',
+  },
+  {
+    type: "tool.declaration_settled",
+    connectionSeq: 43,
+    runSeq: 4,
+    productTurnId: "turn-1",
+    stepId: "step-1",
+    blockId: "block-tool-1",
+    sourceIndex: 0,
+    toolCallId: "tool-call-1",
+  },
+] as const;
+
 function projectToolArgumentFragments(fragments: readonly string[]): {
   readonly rawArguments: string;
   readonly argumentsPreview: string;
@@ -483,7 +526,7 @@ function projectToolArgumentFragments(fragments: readonly string[]): {
   };
 }
 
-function toolGoldenMatches(scenario: Record<string, unknown>): boolean {
+function toolDeclarationSemanticsMatch(scenario: Record<string, unknown>): boolean {
   const events = scenario.events as Array<Record<string, unknown>>;
   const oracle = scenario.expect as Record<string, unknown>;
   const initialPayload = events.find((event) => event.type === "tool.declaration_started")
@@ -541,6 +584,44 @@ function toolGoldenMatches(scenario: Record<string, unknown>): boolean {
     oracle.targetBlockId === initialBlock.blockId &&
     oracle.toolCallId === initialTool.toolCallId &&
     oracle.executionMaySettleOutOfOrder === true
+  );
+}
+
+function toolDeclarationTrace(events: Array<Record<string, unknown>>): unknown[] {
+  return events.map((event) => {
+    const payload = event.payload as Record<string, unknown>;
+    if (event.type === "tool.declaration_delta") {
+      return {
+        type: event.type,
+        connectionSeq: event.connectionSeq,
+        runSeq: event.runSeq,
+        productTurnId: payload.productTurnId,
+        stepId: payload.stepId,
+        blockId: payload.blockId,
+        toolCallId: payload.toolCallId,
+        argumentsFragment: payload.argumentsFragment,
+      };
+    }
+    const block = payload.block as Record<string, unknown>;
+    const tool = block.tool as Record<string, unknown>;
+    return {
+      type: event.type,
+      connectionSeq: event.connectionSeq,
+      runSeq: event.runSeq,
+      productTurnId: payload.productTurnId,
+      stepId: block.stepId,
+      blockId: block.blockId,
+      sourceIndex: block.sourceIndex,
+      toolCallId: tool.toolCallId,
+    };
+  });
+}
+
+function toolGoldenMatches(scenario: Record<string, unknown>): boolean {
+  const events = scenario.events as Array<Record<string, unknown>>;
+  return (
+    isDeepStrictEqual(toolDeclarationTrace(events), EXPECTED_TOOL_DECLARATION_TRACE) &&
+    toolDeclarationSemanticsMatch(scenario)
   );
 }
 
@@ -742,6 +823,112 @@ describe("closed application protocol", () => {
     }
   });
 
+  it("fails closed for every missing or invalid authority identity", () => {
+    const byType = (type: MutationCommandType): MutationAuthorityCase => {
+      const testCase = MUTATION_AUTHORITY_CASES.find(
+        (candidate) => candidate.command.type === type,
+      );
+      if (testCase === undefined) throw new Error(`Missing authority case for ${type}`);
+      return testCase;
+    };
+    const missingWorkspaceTypes = [
+      "session.trash.restore",
+      "session.activate",
+      "session.rename",
+      "session.trash",
+      "runtime.setDesiredModel",
+      "runtime.setDesiredThinking",
+      "run.abort",
+      "run.prompt",
+    ] as const;
+    for (const type of missingWorkspaceTypes) {
+      expect(resolveCommandAuthority(byType(type).command), `${type} missing workspace`).toEqual({
+        ok: false,
+        error: { code: "missing_authority_context", field: "workspaceId" },
+      });
+      for (const workspaceId of ["", "not an opaque id"]) {
+        expect(
+          resolveCommandAuthority(byType(type).command, {
+            ...byType(type).context,
+            workspaceId,
+          }),
+          `${type} invalid workspace`,
+        ).toEqual({
+          ok: false,
+          error: { code: "invalid_authority_identity", field: "workspaceId" },
+        });
+      }
+    }
+
+    const prompt = byType("run.prompt");
+    expect(resolveCommandAuthority(prompt.command, { workspaceId: "workspace-prompt" })).toEqual({
+      ok: false,
+      error: { code: "missing_authority_context", field: "runId" },
+    });
+    expect(
+      resolveCommandAuthority(prompt.command, {
+        workspaceId: "workspace-prompt",
+        runId: "run-prompt",
+      }),
+    ).toEqual({
+      ok: false,
+      error: { code: "missing_authority_context", field: "productTurnId" },
+    });
+    for (const [field, value] of [
+      ["runId", ""],
+      ["runId", "invalid run"],
+      ["productTurnId", ""],
+      ["productTurnId", "invalid turn"],
+    ] as const) {
+      expect(
+        resolveCommandAuthority(prompt.command, { ...prompt.context, [field]: value }),
+        `run.prompt invalid ${field}`,
+      ).toEqual({
+        ok: false,
+        error: { code: "invalid_authority_identity", field },
+      });
+    }
+
+    for (const [type, field, invalidValue] of [
+      ["workspace.updateDisplayName", "workspaceId", ""],
+      ["workspace.remove", "workspaceId", "invalid workspace"],
+      ["workspace.remove", "workspaceId", undefined],
+      ["session.create", "workspaceId", ""],
+      ["session.activate", "sessionId", ""],
+      ["session.activate", "sessionId", undefined],
+      ["session.rename", "sessionId", "invalid session"],
+      ["session.trash", "sessionId", ""],
+      ["runtime.setDesiredModel", "sessionId", "invalid session"],
+      ["runtime.setDesiredThinking", "sessionId", ""],
+      ["run.abort", "runId", "invalid run"],
+      ["run.abort", "runId", undefined],
+      ["run.abort", "sessionId", "invalid session"],
+      ["run.prompt", "sessionId", ""],
+    ] as const) {
+      const testCase = byType(type);
+      const command = structuredClone(testCase.command) as unknown as Record<string, unknown>;
+      if (field === "workspaceId" || field === "runId") {
+        (command.payload as Record<string, unknown>)[field] = invalidValue;
+      } else {
+        command[field] = invalidValue;
+      }
+      expect(
+        resolveCommandAuthority(command as unknown as MutationCommand, testCase.context),
+        `${type} invalid command ${field}`,
+      ).toEqual({
+        ok: false,
+        error: { code: "invalid_authority_identity", field },
+      });
+    }
+
+    expect(
+      resolveCommandAuthority({ type: "future.mutation" } as unknown as MutationCommand),
+    ).toEqual({
+      ok: false,
+      error: { code: "unsupported_mutation", commandType: "future.mutation" },
+    });
+  });
+
   it("keeps every wire object closed except intentional JsonValue records", () => {
     const visited = new Set<object>();
     const visit = (schema: unknown): void => {
@@ -899,6 +1086,33 @@ describe("closed application protocol", () => {
     changedExpectedTool.toolCallId = "different-tool-call";
     (changedToolIdentity.expect as Record<string, unknown>).toolCallId = "different-tool-call";
     expect(toolGoldenMatches(changedToolIdentity), "final tool identity cross-check").toBe(false);
+
+    const sourceEvents = scenario.events as Array<Record<string, unknown>>;
+    for (const index of sourceEvents.keys()) {
+      for (const field of ["connectionSeq", "runSeq"] as const) {
+        const changedSequence = structuredClone(scenario);
+        const event = (changedSequence.events as Array<Record<string, unknown>>)[index];
+        if (event === undefined) throw new Error(`Missing tool event ${index}`);
+        event[field] = Number(event[field]) + 10;
+        expect(toolGoldenMatches(changedSequence), `event ${index} ${field}`).toBe(false);
+      }
+    }
+
+    const movedSettlement = structuredClone(scenario);
+    const movedEvents = movedSettlement.events as Array<Record<string, unknown>>;
+    movedSettlement.events = [movedEvents[0], movedEvents[1], movedEvents[3], movedEvents[2]];
+    expect(toolGoldenMatches(movedSettlement), "settlement before final delta").toBe(false);
+
+    const refragmented = structuredClone(scenario);
+    const refragmentedDeltas = (refragmented.events as Array<Record<string, unknown>>)
+      .filter((event) => event.type === "tool.declaration_delta")
+      .map((event) => event.payload as Record<string, unknown>);
+    const firstFragment = String(refragmentedDeltas[0]?.argumentsFragment);
+    const secondFragment = String(refragmentedDeltas[1]?.argumentsFragment);
+    refragmentedDeltas[0]!.argumentsFragment = `${firstFragment}${secondFragment[0]}`;
+    refragmentedDeltas[1]!.argumentsFragment = secondFragment.slice(1);
+    expect(toolDeclarationSemanticsMatch(refragmented), "same concatenated arguments").toBe(true);
+    expect(toolGoldenMatches(refragmented), "exact fragment sequence").toBe(false);
   });
 
   it("matches ordered tool fragments with scalar-safe byte truncation and parsed arguments", () => {
@@ -955,7 +1169,7 @@ describe("closed application protocol", () => {
     expect(settledTool.argumentsPreview).toBe(projected.argumentsPreview);
     expect(settledTool.argumentsTruncated).toBe(true);
     expect(settledTool.arguments).toEqual(JSON.parse(rawArguments));
-    expect(toolGoldenMatches(scenario)).toBe(true);
+    expect(toolDeclarationSemanticsMatch(scenario)).toBe(true);
   });
 
   it("classifies client and server codec failures without exception leakage", () => {

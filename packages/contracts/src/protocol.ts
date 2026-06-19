@@ -1056,14 +1056,30 @@ export interface ResolvedCommandAuthority {
   readonly productTurnId: string | null;
 }
 
+export type CommandAuthorityIdentityField =
+  | "authorityId"
+  | "workspaceId"
+  | "sessionId"
+  | "runId"
+  | "productTurnId";
+
 export type CommandAuthorityResolution =
   | { readonly ok: true; readonly value: ResolvedCommandAuthority }
   | {
       readonly ok: false;
-      readonly error: {
-        readonly code: "missing_authority_context";
-        readonly field: keyof CommandAuthorityContext;
-      };
+      readonly error:
+        | {
+            readonly code: "missing_authority_context";
+            readonly field: keyof CommandAuthorityContext;
+          }
+        | {
+            readonly code: "invalid_authority_identity";
+            readonly field: CommandAuthorityIdentityField;
+          }
+        | {
+            readonly code: "unsupported_mutation";
+            readonly commandType: string;
+          };
     };
 
 type MutationCommandEnvelope = CommandEnvelopeByType[MutationCommandType];
@@ -1075,6 +1091,13 @@ const missingAuthorityContext = (
   error: { code: "missing_authority_context", field },
 });
 
+const invalidAuthorityContext = (
+  field: CommandAuthorityIdentityField,
+): CommandAuthorityResolution => ({
+  ok: false,
+  error: { code: "invalid_authority_identity", field },
+});
+
 const resolvedAuthority = (
   commandType: MutationCommandType,
   authorityId: string,
@@ -1082,19 +1105,37 @@ const resolvedAuthority = (
   sessionId: string | null,
   runId: string | null,
   productTurnId: string | null,
-): CommandAuthorityResolution => ({
-  ok: true,
-  value: {
-    commandType,
-    scope: MUTATION_AUTHORITY[commandType].scope,
-    authorityId,
-    workspaceId,
-    sessionId,
-    runId,
-    productTurnId,
-  },
-});
+): CommandAuthorityResolution => {
+  for (const [field, value] of [
+    ["workspaceId", workspaceId],
+    ["sessionId", sessionId],
+    ["runId", runId],
+    ["productTurnId", productTurnId],
+    ["authorityId", authorityId],
+  ] as const) {
+    if (value !== null && !Value.Check(OpaqueIdSchema, value)) {
+      return invalidAuthorityContext(field);
+    }
+  }
+  return {
+    ok: true,
+    value: {
+      commandType,
+      scope: MUTATION_AUTHORITY[commandType].scope,
+      authorityId,
+      workspaceId,
+      sessionId,
+      runId,
+      productTurnId,
+    },
+  };
+};
 
+/**
+ * Resolves receipt authority after the command has passed its public envelope schema.
+ * Domain lookups and Prompt allocations are supplied as context; every identity used
+ * in the returned receipt is guarded as an OpaqueId before success.
+ */
 export function resolveCommandAuthority(
   command: MutationCommandEnvelope,
   context: CommandAuthorityContext = {},
@@ -1168,8 +1209,14 @@ export function resolveCommandAuthority(
         context.productTurnId,
       );
     default: {
-      const exhaustive: never = command;
-      return exhaustive;
+      const unsupported: never = command;
+      return {
+        ok: false,
+        error: {
+          code: "unsupported_mutation",
+          commandType: String((unsupported as MutationCommandEnvelope).type),
+        },
+      };
     }
   }
 }
