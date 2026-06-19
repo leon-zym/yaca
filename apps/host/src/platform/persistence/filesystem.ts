@@ -3,7 +3,14 @@ import { chmod, lstat, open, realpath } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { PersistenceError, persistenceError } from "./errors.js";
 
-export type PersistenceOperation = "read" | "write" | "file-fsync" | "rename" | "directory-fsync";
+export type PersistenceOperation =
+  | "read"
+  | "write"
+  | "file-fsync"
+  | "rename"
+  | "directory-fsync"
+  | "quarantine-write"
+  | "quarantine-verified";
 
 export type PersistenceFaultInjector = (operation: PersistenceOperation) => void | Promise<void>;
 

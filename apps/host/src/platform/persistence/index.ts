@@ -1,6 +1,7 @@
 export { AtomicJsonFile } from "./atomic-json-file.js";
 export {
   DurableJsonl,
+  type DurableJsonlOptions,
   type DurableJsonlStatus,
   type JsonlReadResult,
   type QuarantinedJsonlTail,

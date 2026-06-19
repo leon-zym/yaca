@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, mkdir, open, realpath } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, realpath } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import { PersistenceError, persistenceError } from "./errors.js";
 import {
@@ -13,8 +13,14 @@ import {
 } from "./filesystem.js";
 
 export interface QuarantinedJsonlTail {
-  path: string;
-  byteLength: number;
+  readonly id: string;
+  readonly byteLength: number;
+  readonly read: () => Promise<Buffer>;
+}
+
+interface EvidenceFileIdentity {
+  device: bigint;
+  inode: bigint;
 }
 
 export interface JsonlReadResult<T> {
@@ -24,15 +30,19 @@ export interface JsonlReadResult<T> {
 
 export type DurableJsonlStatus = "healthy" | "degraded";
 
+export interface DurableJsonlOptions<T> extends PersistenceOptions<T> {
+  quarantinePrimaryDigest?: (source: Uint8Array) => string;
+}
+
 export class DurableJsonl<T> {
   readonly #requestedPath: string;
-  readonly #options: PersistenceOptions<T>;
+  readonly #options: DurableJsonlOptions<T>;
   #degradedResult: JsonlReadResult<T> | undefined;
   #inspected = false;
   #queue: Promise<void> = Promise.resolve();
   #status: DurableJsonlStatus = "healthy";
 
-  constructor(path: string, options: PersistenceOptions<T> = {}) {
+  constructor(path: string, options: DurableJsonlOptions<T> = {}) {
     this.#requestedPath = path;
     this.#options = options;
   }
@@ -96,6 +106,7 @@ export class DurableJsonl<T> {
       target.directory,
       target.path,
       bytes,
+      offset,
       bytes.subarray(offset),
     );
     this.#degradedResult = { records, quarantinedTail };
@@ -146,6 +157,7 @@ export class DurableJsonl<T> {
     sourceDirectory: string,
     sourcePath: string,
     source: Buffer,
+    validPrefixByteLength: number,
     tail: Buffer,
   ): Promise<QuarantinedJsonlTail> {
     try {
@@ -157,8 +169,27 @@ export class DurableJsonl<T> {
       if (relation.startsWith("..") || relation === "" || relation.startsWith("/")) {
         throw new PersistenceError("unsafe_symbolic_link");
       }
-      const fingerprint = createHash("sha256").update(source).digest("hex");
-      const quarantinePath = join(quarantineDirectory, `tail-${fingerprint}.jsonl`);
+      const primaryDigest =
+        this.#options.quarantinePrimaryDigest?.(source) ??
+        createHash("sha256").update("yaca:source-primary\0").update(source).digest("hex");
+      const identity = JSON.stringify({
+        version: 1,
+        primaryDigest,
+        secondaryDigest: createHash("sha512")
+          .update("yaca:source-secondary\0")
+          .update(source)
+          .digest("hex"),
+        sourceByteLength: source.byteLength,
+        validPrefixByteLength,
+        validPrefixDigest: createHash("sha256")
+          .update("yaca:valid-prefix\0")
+          .update(source.subarray(0, validPrefixByteLength))
+          .digest("hex"),
+        tailByteLength: tail.byteLength,
+        tailDigest: createHash("sha256").update("yaca:tail\0").update(tail).digest("hex"),
+      });
+      const id = createHash("sha256").update(identity).digest("hex");
+      const quarantinePath = join(quarantineDirectory, `tail-${id}.jsonl`);
       let handle;
       try {
         handle = await open(
@@ -166,6 +197,7 @@ export class DurableJsonl<T> {
           constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
           0o600,
         );
+        await injectFault(this.#options.faultInjector, "quarantine-write");
         await handle.writeFile(tail);
         await handle.sync();
         await handle.close();
@@ -174,19 +206,66 @@ export class DurableJsonl<T> {
       } catch (error) {
         await handle?.close();
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        const existing = await open(quarantinePath, constants.O_RDONLY | constants.O_NOFOLLOW);
-        try {
-          await existing.chmod(0o600);
-          if (!(await existing.readFile()).equals(tail)) {
-            throw new PersistenceError("io_failure");
-          }
-        } finally {
-          await existing.close();
-        }
       }
-      return { path: quarantinePath, byteLength: tail.byteLength };
+      const verified = await this.#readEvidence(quarantinePath, tail);
+      return Object.freeze({
+        id,
+        byteLength: tail.byteLength,
+        read: () =>
+          this.#readEvidence(quarantinePath, tail, verified.identity).then(({ bytes }) => bytes),
+      });
     } catch (error) {
       throw persistenceError(error);
+    }
+  }
+
+  async #readEvidence(
+    path: string,
+    expectedBytes: Buffer,
+    expectedIdentity?: EvidenceFileIdentity,
+  ): Promise<{ bytes: Buffer; identity: EvidenceFileIdentity }> {
+    let handle;
+    try {
+      const candidate = await lstat(path, { bigint: true });
+      if (candidate.isSymbolicLink()) throw new PersistenceError("unsafe_symbolic_link");
+      if (!candidate.isFile()) throw new PersistenceError("io_failure");
+      handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      const opened = await handle.stat({ bigint: true });
+      if (!opened.isFile()) throw new PersistenceError("io_failure");
+      await handle.chmod(0o600);
+      const before = await handle.stat({ bigint: true });
+      const bytes = await handle.readFile();
+      const after = await handle.stat({ bigint: true });
+      if (
+        before.dev !== after.dev ||
+        before.ino !== after.ino ||
+        before.size !== after.size ||
+        before.mtimeNs !== after.mtimeNs ||
+        before.ctimeNs !== after.ctimeNs ||
+        !bytes.equals(expectedBytes)
+      ) {
+        throw new PersistenceError("io_failure");
+      }
+      if (
+        expectedIdentity &&
+        (expectedIdentity.device !== after.dev || expectedIdentity.inode !== after.ino)
+      ) {
+        throw new PersistenceError("io_failure");
+      }
+      await injectFault(this.#options.faultInjector, "quarantine-verified");
+      const pathIdentity = await lstat(path, { bigint: true });
+      if (
+        !pathIdentity.isFile() ||
+        pathIdentity.dev !== after.dev ||
+        pathIdentity.ino !== after.ino
+      ) {
+        throw new PersistenceError("io_failure");
+      }
+      return { bytes, identity: { device: after.dev, inode: after.ino } };
+    } catch (error) {
+      throw persistenceError(error);
+    } finally {
+      await handle?.close();
     }
   }
 }
