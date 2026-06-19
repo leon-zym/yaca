@@ -32,6 +32,10 @@ import {
   HealthResponseSchema,
   MUTATION_AUTHORITY,
   MUTATION_COMMAND_TYPES,
+  resolveCommandAuthority,
+  type CommandAuthorityContext,
+  type CommandEnvelopeByType,
+  type CommandReceipt,
   type MutationAuthorityDescriptor,
   type MutationCommandType,
   JsonValueSchema,
@@ -41,6 +45,7 @@ import {
   SuccessResponseSchema,
   ThemeSettingSchema,
   ContentPreviewSchema,
+  ToolDeclarationDeltaPayloadSchema,
   ToolDeclarationSettledPayloadSchema,
   ToolDeclarationStartedPayloadSchema,
   Value,
@@ -116,6 +121,368 @@ const EXPECTED_MUTATION_AUTHORITY = {
   },
 } as const satisfies Record<MutationCommandType, MutationAuthorityDescriptor>;
 
+type MutationCommand = CommandEnvelopeByType[MutationCommandType];
+type ExpectedReceiptAuthority = Pick<
+  CommandReceipt,
+  "commandType" | "scope" | "authorityId" | "workspaceId" | "sessionId" | "runId" | "productTurnId"
+>;
+
+interface MutationAuthorityCase {
+  readonly command: MutationCommand;
+  readonly context: CommandAuthorityContext;
+  readonly expected: ExpectedReceiptAuthority;
+}
+
+const MUTATION_AUTHORITY_CASES = [
+  {
+    command: {
+      v: 1,
+      requestId: "request-theme",
+      type: "app.setThemePreference",
+      clientMutationId: "mutation-theme",
+      sessionId: null,
+      expectedSessionVersion: null,
+      payload: { themePreference: "dark" },
+    },
+    context: {},
+    expected: {
+      commandType: "app.setThemePreference",
+      scope: "host",
+      authorityId: "app",
+      workspaceId: null,
+      sessionId: null,
+      runId: null,
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-register",
+      type: "workspace.register",
+      clientMutationId: "mutation-register",
+      sessionId: null,
+      expectedSessionVersion: null,
+      payload: { path: "/tmp/workspace-register", displayName: "Registered" },
+    },
+    context: {},
+    expected: {
+      commandType: "workspace.register",
+      scope: "host",
+      authorityId: "workspace-catalog",
+      workspaceId: null,
+      sessionId: null,
+      runId: null,
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-select",
+      type: "workspace.select",
+      clientMutationId: "mutation-select",
+      sessionId: null,
+      expectedSessionVersion: null,
+      payload: { workspaceId: "workspace-select" },
+    },
+    context: {},
+    expected: {
+      commandType: "workspace.select",
+      scope: "host",
+      authorityId: "selection",
+      workspaceId: null,
+      sessionId: null,
+      runId: null,
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-display-name",
+      type: "workspace.updateDisplayName",
+      clientMutationId: "mutation-display-name",
+      sessionId: null,
+      expectedSessionVersion: null,
+      payload: { workspaceId: "workspace-display-name", displayName: "Renamed" },
+    },
+    context: {},
+    expected: {
+      commandType: "workspace.updateDisplayName",
+      scope: "workspace",
+      authorityId: "workspace-display-name",
+      workspaceId: "workspace-display-name",
+      sessionId: null,
+      runId: null,
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-remove",
+      type: "workspace.remove",
+      clientMutationId: "mutation-remove",
+      sessionId: null,
+      expectedSessionVersion: null,
+      payload: { workspaceId: "workspace-remove" },
+    },
+    context: {},
+    expected: {
+      commandType: "workspace.remove",
+      scope: "workspace",
+      authorityId: "workspace-remove",
+      workspaceId: "workspace-remove",
+      sessionId: null,
+      runId: null,
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-create",
+      type: "session.create",
+      clientMutationId: "mutation-create",
+      sessionId: null,
+      expectedSessionVersion: null,
+      payload: { workspaceId: "workspace-create", title: "Created session" },
+    },
+    context: {},
+    expected: {
+      commandType: "session.create",
+      scope: "workspace",
+      authorityId: "workspace-create",
+      workspaceId: "workspace-create",
+      sessionId: null,
+      runId: null,
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-activate",
+      type: "session.activate",
+      clientMutationId: "mutation-activate",
+      sessionId: "session-activate",
+      expectedSessionVersion: "version-activate",
+      payload: {},
+    },
+    context: { workspaceId: "workspace-activate" },
+    expected: {
+      commandType: "session.activate",
+      scope: "session",
+      authorityId: "session-activate",
+      workspaceId: "workspace-activate",
+      sessionId: "session-activate",
+      runId: null,
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-rename",
+      type: "session.rename",
+      clientMutationId: "mutation-rename",
+      sessionId: "session-rename",
+      expectedSessionVersion: "version-rename",
+      payload: { title: "Renamed session" },
+    },
+    context: { workspaceId: "workspace-rename" },
+    expected: {
+      commandType: "session.rename",
+      scope: "session",
+      authorityId: "session-rename",
+      workspaceId: "workspace-rename",
+      sessionId: "session-rename",
+      runId: null,
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-trash",
+      type: "session.trash",
+      clientMutationId: "mutation-trash",
+      sessionId: "session-trash",
+      expectedSessionVersion: "version-trash",
+      payload: {},
+    },
+    context: { workspaceId: "workspace-trash" },
+    expected: {
+      commandType: "session.trash",
+      scope: "session",
+      authorityId: "session-trash",
+      workspaceId: "workspace-trash",
+      sessionId: "session-trash",
+      runId: null,
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-restore",
+      type: "session.trash.restore",
+      clientMutationId: "mutation-restore",
+      sessionId: null,
+      expectedSessionVersion: null,
+      payload: { trashId: "trash-restore" },
+    },
+    context: { workspaceId: "workspace-restore" },
+    expected: {
+      commandType: "session.trash.restore",
+      scope: "workspace",
+      authorityId: "workspace-restore",
+      workspaceId: "workspace-restore",
+      sessionId: null,
+      runId: null,
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-prompt",
+      type: "run.prompt",
+      clientMutationId: "mutation-prompt",
+      sessionId: "session-prompt",
+      expectedSessionVersion: "version-prompt",
+      payload: { text: "Read the repository." },
+    },
+    context: {
+      workspaceId: "workspace-prompt",
+      runId: "run-prompt",
+      productTurnId: "turn-prompt",
+    },
+    expected: {
+      commandType: "run.prompt",
+      scope: "run",
+      authorityId: "run-prompt",
+      workspaceId: "workspace-prompt",
+      sessionId: "session-prompt",
+      runId: "run-prompt",
+      productTurnId: "turn-prompt",
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-abort",
+      type: "run.abort",
+      clientMutationId: "mutation-abort",
+      sessionId: "session-abort",
+      expectedSessionVersion: "version-abort",
+      payload: { runId: "run-abort" },
+    },
+    context: { workspaceId: "workspace-abort" },
+    expected: {
+      commandType: "run.abort",
+      scope: "run",
+      authorityId: "run-abort",
+      workspaceId: "workspace-abort",
+      sessionId: "session-abort",
+      runId: "run-abort",
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-acknowledge",
+      type: "command.acknowledgeUnknown",
+      clientMutationId: "mutation-acknowledge",
+      sessionId: null,
+      expectedSessionVersion: null,
+      payload: { receiptId: "receipt-unknown", expectedState: "delivery_unknown" },
+    },
+    context: {},
+    expected: {
+      commandType: "command.acknowledgeUnknown",
+      scope: "host",
+      authorityId: "app",
+      workspaceId: null,
+      sessionId: null,
+      runId: null,
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-model",
+      type: "runtime.setDesiredModel",
+      clientMutationId: "mutation-model",
+      sessionId: "session-model",
+      expectedSessionVersion: "version-model",
+      payload: { model: { providerId: "deepseek", modelId: "deepseek-chat" } },
+    },
+    context: { workspaceId: "workspace-model" },
+    expected: {
+      commandType: "runtime.setDesiredModel",
+      scope: "session",
+      authorityId: "session-model",
+      workspaceId: "workspace-model",
+      sessionId: "session-model",
+      runId: null,
+      productTurnId: null,
+    },
+  },
+  {
+    command: {
+      v: 1,
+      requestId: "request-thinking",
+      type: "runtime.setDesiredThinking",
+      clientMutationId: "mutation-thinking",
+      sessionId: "session-thinking",
+      expectedSessionVersion: "version-thinking",
+      payload: { thinkingLevel: "high" },
+    },
+    context: { workspaceId: "workspace-thinking" },
+    expected: {
+      commandType: "runtime.setDesiredThinking",
+      scope: "session",
+      authorityId: "session-thinking",
+      workspaceId: "workspace-thinking",
+      sessionId: "session-thinking",
+      runId: null,
+      productTurnId: null,
+    },
+  },
+] as const satisfies readonly MutationAuthorityCase[];
+
+function projectToolArgumentFragments(fragments: readonly string[]): {
+  readonly rawArguments: string;
+  readonly argumentsPreview: string;
+  readonly argumentsTruncated: boolean;
+} {
+  const encoder = new TextEncoder();
+  let serializedBytes = 2;
+  let argumentsPreview = "";
+  let argumentsTruncated = false;
+  append: for (const fragment of fragments) {
+    for (const scalar of fragment) {
+      const serializedScalar = JSON.stringify(scalar);
+      const scalarBytes = encoder.encode(serializedScalar).byteLength - 2;
+      if (serializedBytes + scalarBytes > 65_536) {
+        argumentsTruncated = true;
+        break append;
+      }
+      argumentsPreview += scalar;
+      serializedBytes += scalarBytes;
+    }
+  }
+  return {
+    rawArguments: fragments.join(""),
+    argumentsPreview,
+    argumentsTruncated,
+  };
+}
+
 function toolGoldenMatches(scenario: Record<string, unknown>): boolean {
   const events = scenario.events as Array<Record<string, unknown>>;
   const oracle = scenario.expect as Record<string, unknown>;
@@ -127,6 +494,18 @@ function toolGoldenMatches(scenario: Record<string, unknown>): boolean {
   const initialBlock = initialPayload.block as Record<string, unknown>;
   const finalBlock = finalPayload.block as Record<string, unknown>;
   const initialTool = initialBlock.tool as Record<string, unknown>;
+  const finalTool = finalBlock.tool as Record<string, unknown>;
+  const deltaPayloads = events
+    .filter((event) => event.type === "tool.declaration_delta")
+    .map((event) => event.payload as Record<string, unknown>);
+  const fragments = deltaPayloads.map((payload) => payload.argumentsFragment as string);
+  const projected = projectToolArgumentFragments(fragments);
+  let parsedArguments: unknown;
+  try {
+    parsedArguments = JSON.parse(projected.rawArguments) as unknown;
+  } catch {
+    return false;
+  }
   const expectedKeys = [
     "executionMaySettleOutOfOrder",
     "finalToolBlock",
@@ -137,9 +516,28 @@ function toolGoldenMatches(scenario: Record<string, unknown>): boolean {
   return (
     isDeepStrictEqual(Object.keys(oracle).sort(), expectedKeys) &&
     Value.Check(ToolDeclarationStartedPayloadSchema, initialPayload) &&
+    deltaPayloads.every(
+      (payload) =>
+        Value.Check(ToolDeclarationDeltaPayloadSchema, payload) &&
+        payload.productTurnId === initialPayload.productTurnId &&
+        payload.stepId === initialBlock.stepId &&
+        payload.blockId === initialBlock.blockId &&
+        payload.toolCallId === initialTool.toolCallId,
+    ) &&
     Value.Check(ToolDeclarationSettledPayloadSchema, finalPayload) &&
     isDeepStrictEqual(oracle.initialToolBlock, initialBlock) &&
     isDeepStrictEqual(oracle.finalToolBlock, finalBlock) &&
+    finalPayload.productTurnId === initialPayload.productTurnId &&
+    finalBlock.blockId === initialBlock.blockId &&
+    finalBlock.stepId === initialBlock.stepId &&
+    finalBlock.sourceIndex === initialBlock.sourceIndex &&
+    finalTool.toolCallId === initialTool.toolCallId &&
+    finalTool.name === initialTool.name &&
+    finalTool.toolKind === initialTool.toolKind &&
+    finalTool.startedAt === initialTool.startedAt &&
+    finalTool.argumentsPreview === projected.argumentsPreview &&
+    finalTool.argumentsTruncated === projected.argumentsTruncated &&
+    isDeepStrictEqual(finalTool.arguments, parsedArguments) &&
     oracle.targetBlockId === initialBlock.blockId &&
     oracle.toolCallId === initialTool.toolCallId &&
     oracle.executionMaySettleOutOfOrder === true
@@ -299,6 +697,51 @@ describe("closed application protocol", () => {
     });
   });
 
+  it("resolves every real mutation command to its exact receipt authority and lineage", () => {
+    expect(MUTATION_AUTHORITY_CASES).toHaveLength(15);
+    expect(MUTATION_AUTHORITY_CASES.map(({ command }) => command.type).sort()).toEqual(
+      [...MUTATION_COMMAND_TYPES].sort(),
+    );
+
+    for (const testCase of MUTATION_AUTHORITY_CASES) {
+      const { command, context, expected } = testCase;
+      expect(
+        Value.Check(COMMAND_ENVELOPE_SCHEMAS[command.type], command),
+        `${command.type} command fixture`,
+      ).toBe(true);
+
+      const resolved = resolveCommandAuthority(command, context);
+      expect(resolved, `${command.type} resolution`).toEqual({ ok: true, value: expected });
+      if (!resolved.ok) continue;
+
+      const receipt: CommandReceipt = {
+        receiptId: `receipt-${command.requestId}`,
+        clientMutationId: command.clientMutationId,
+        ...resolved.value,
+        state: "recorded",
+        riskAcknowledgement: "not_required",
+        recordedAt: "2026-08-19T00:00:00.000Z",
+        acceptedAt: null,
+        terminalAt: null,
+        acknowledgedAt: null,
+        error: null,
+      };
+      expect(Value.Check(CommandReceiptSchema, receipt), `${command.type} receipt`).toBe(true);
+      expect(
+        {
+          commandType: receipt.commandType,
+          scope: receipt.scope,
+          authorityId: receipt.authorityId,
+          workspaceId: receipt.workspaceId,
+          sessionId: receipt.sessionId,
+          runId: receipt.runId,
+          productTurnId: receipt.productTurnId,
+        },
+        `${command.type} receipt authority`,
+      ).toEqual(expected);
+    }
+  });
+
   it("keeps every wire object closed except intentional JsonValue records", () => {
     const visited = new Set<object>();
     const visit = (schema: unknown): void => {
@@ -400,6 +843,119 @@ describe("closed application protocol", () => {
     >;
     (expectedFinal.tool as Record<string, unknown>).summary = "changed";
     expect(toolGoldenMatches(changed)).toBe(false);
+
+    const deltaIndexes = (scenario.events as Array<Record<string, unknown>>)
+      .map((event, index) => (event.type === "tool.declaration_delta" ? index : -1))
+      .filter((index) => index >= 0);
+    expect(deltaIndexes).toHaveLength(2);
+    for (const index of deltaIndexes) {
+      for (const field of ["blockId", "toolCallId"] as const) {
+        const wrongTarget = structuredClone(scenario);
+        const payload = (wrongTarget.events as Array<Record<string, unknown>>)[index]
+          ?.payload as Record<string, unknown>;
+        payload[field] = `wrong-${field}`;
+        expect(toolGoldenMatches(wrongTarget), `delta ${index} ${field}`).toBe(false);
+      }
+      const wrongFragment = structuredClone(scenario);
+      const payload = (wrongFragment.events as Array<Record<string, unknown>>)[index]
+        ?.payload as Record<string, unknown>;
+      payload.argumentsFragment = `${String(payload.argumentsFragment)}x`;
+      expect(toolGoldenMatches(wrongFragment), `delta ${index} fragment`).toBe(false);
+    }
+
+    for (const [field, value] of [
+      ["blockId", "different-block"],
+      ["stepId", "different-step"],
+      ["sourceIndex", 1],
+    ] as const) {
+      const changedIdentity = structuredClone(scenario);
+      const finalEvent = (changedIdentity.events as Array<Record<string, unknown>>).at(-1);
+      const finalBlock = (finalEvent?.payload as Record<string, unknown>).block as Record<
+        string,
+        unknown
+      >;
+      finalBlock[field] = value;
+      (
+        (changedIdentity.expect as Record<string, unknown>).finalToolBlock as Record<
+          string,
+          unknown
+        >
+      )[field] = value;
+      expect(toolGoldenMatches(changedIdentity), `final ${field} cross-check`).toBe(false);
+    }
+
+    const changedToolIdentity = structuredClone(scenario);
+    const changedFinalEvent = (changedToolIdentity.events as Array<Record<string, unknown>>).at(-1);
+    const changedFinalTool = (
+      (changedFinalEvent?.payload as Record<string, unknown>).block as Record<string, unknown>
+    ).tool as Record<string, unknown>;
+    const changedExpectedTool = (
+      (changedToolIdentity.expect as Record<string, unknown>).finalToolBlock as Record<
+        string,
+        unknown
+      >
+    ).tool as Record<string, unknown>;
+    changedFinalTool.toolCallId = "different-tool-call";
+    changedExpectedTool.toolCallId = "different-tool-call";
+    (changedToolIdentity.expect as Record<string, unknown>).toolCallId = "different-tool-call";
+    expect(toolGoldenMatches(changedToolIdentity), "final tool identity cross-check").toBe(false);
+  });
+
+  it("matches ordered tool fragments with scalar-safe byte truncation and parsed arguments", () => {
+    const scenario = fixture("tool-declaration-stream.json");
+    const rawArguments = JSON.stringify({ values: ["界".repeat(11_000), "界".repeat(11_000)] });
+    const scalars = [...rawArguments];
+    const fragments: string[] = [];
+    for (let index = 0; index < scalars.length; index += 8_000) {
+      fragments.push(scalars.slice(index, index + 8_000).join(""));
+    }
+    const projected = projectToolArgumentFragments(fragments);
+    expect(projected.argumentsTruncated).toBe(true);
+    expect(
+      new TextEncoder().encode(JSON.stringify(projected.argumentsPreview)).byteLength,
+    ).toBeLessThanOrEqual(65_536);
+    const nextScalar = scalars[[...projected.argumentsPreview].length];
+    expect(nextScalar).toBe("界");
+    expect(
+      new TextEncoder().encode(JSON.stringify(`${projected.argumentsPreview}${nextScalar}`))
+        .byteLength,
+    ).toBeGreaterThan(65_536);
+
+    const sourceEvents = scenario.events as Array<Record<string, unknown>>;
+    const deltaTemplate = sourceEvents.find((event) => event.type === "tool.declaration_delta");
+    const settled = structuredClone(sourceEvents.at(-1)) as Record<string, unknown>;
+    const settledBlock = (settled.payload as Record<string, unknown>).block as Record<
+      string,
+      unknown
+    >;
+    const settledTool = settledBlock.tool as Record<string, unknown>;
+    settledTool.argumentsPreview = projected.argumentsPreview;
+    settledTool.argumentsTruncated = true;
+    settledTool.arguments = JSON.parse(rawArguments) as unknown;
+    const deltas = fragments.map((argumentsFragment, index) => {
+      const event = structuredClone(deltaTemplate) as Record<string, unknown>;
+      event.connectionSeq = 41 + index;
+      event.runSeq = 2 + index;
+      (event.payload as Record<string, unknown>).argumentsFragment = argumentsFragment;
+      return event;
+    });
+    settled.connectionSeq = 41 + deltas.length;
+    settled.runSeq = 2 + deltas.length;
+    scenario.events = [sourceEvents[0], ...deltas, settled];
+    (scenario.expect as Record<string, unknown>).finalToolBlock = structuredClone(settledBlock);
+
+    expect(
+      deltas.every((event) =>
+        Value.Check(ToolDeclarationDeltaPayloadSchema, event.payload as Record<string, unknown>),
+      ),
+    ).toBe(true);
+    expect(
+      Value.Check(ToolDeclarationSettledPayloadSchema, settled.payload as Record<string, unknown>),
+    ).toBe(true);
+    expect(settledTool.argumentsPreview).toBe(projected.argumentsPreview);
+    expect(settledTool.argumentsTruncated).toBe(true);
+    expect(settledTool.arguments).toEqual(JSON.parse(rawArguments));
+    expect(toolGoldenMatches(scenario)).toBe(true);
   });
 
   it("classifies client and server codec failures without exception leakage", () => {

@@ -1040,6 +1040,140 @@ export const MUTATION_AUTHORITY = {
   },
 } as const satisfies Record<MutationCommandType, MutationAuthorityDescriptor>;
 
+export interface CommandAuthorityContext {
+  readonly workspaceId?: string;
+  readonly runId?: string;
+  readonly productTurnId?: string;
+}
+
+export interface ResolvedCommandAuthority {
+  readonly commandType: MutationCommandType;
+  readonly scope: "host" | "workspace" | "session" | "run";
+  readonly authorityId: string;
+  readonly workspaceId: string | null;
+  readonly sessionId: string | null;
+  readonly runId: string | null;
+  readonly productTurnId: string | null;
+}
+
+export type CommandAuthorityResolution =
+  | { readonly ok: true; readonly value: ResolvedCommandAuthority }
+  | {
+      readonly ok: false;
+      readonly error: {
+        readonly code: "missing_authority_context";
+        readonly field: keyof CommandAuthorityContext;
+      };
+    };
+
+type MutationCommandEnvelope = CommandEnvelopeByType[MutationCommandType];
+
+const missingAuthorityContext = (
+  field: keyof CommandAuthorityContext,
+): CommandAuthorityResolution => ({
+  ok: false,
+  error: { code: "missing_authority_context", field },
+});
+
+const resolvedAuthority = (
+  commandType: MutationCommandType,
+  authorityId: string,
+  workspaceId: string | null,
+  sessionId: string | null,
+  runId: string | null,
+  productTurnId: string | null,
+): CommandAuthorityResolution => ({
+  ok: true,
+  value: {
+    commandType,
+    scope: MUTATION_AUTHORITY[commandType].scope,
+    authorityId,
+    workspaceId,
+    sessionId,
+    runId,
+    productTurnId,
+  },
+});
+
+export function resolveCommandAuthority(
+  command: MutationCommandEnvelope,
+  context: CommandAuthorityContext = {},
+): CommandAuthorityResolution {
+  switch (command.type) {
+    case "app.setThemePreference":
+    case "command.acknowledgeUnknown":
+      return resolvedAuthority(command.type, "app", null, null, null, null);
+    case "workspace.register":
+      return resolvedAuthority(command.type, "workspace-catalog", null, null, null, null);
+    case "workspace.select":
+      return resolvedAuthority(command.type, "selection", null, null, null, null);
+    case "workspace.updateDisplayName":
+    case "workspace.remove":
+    case "session.create":
+      return resolvedAuthority(
+        command.type,
+        command.payload.workspaceId,
+        command.payload.workspaceId,
+        null,
+        null,
+        null,
+      );
+    case "session.trash.restore":
+      return context.workspaceId === undefined
+        ? missingAuthorityContext("workspaceId")
+        : resolvedAuthority(
+            command.type,
+            context.workspaceId,
+            context.workspaceId,
+            null,
+            null,
+            null,
+          );
+    case "session.activate":
+    case "session.rename":
+    case "session.trash":
+    case "runtime.setDesiredModel":
+    case "runtime.setDesiredThinking":
+      return context.workspaceId === undefined
+        ? missingAuthorityContext("workspaceId")
+        : resolvedAuthority(
+            command.type,
+            command.sessionId,
+            context.workspaceId,
+            command.sessionId,
+            null,
+            null,
+          );
+    case "run.abort":
+      return context.workspaceId === undefined
+        ? missingAuthorityContext("workspaceId")
+        : resolvedAuthority(
+            command.type,
+            command.payload.runId,
+            context.workspaceId,
+            command.sessionId,
+            command.payload.runId,
+            null,
+          );
+    case "run.prompt":
+      if (context.workspaceId === undefined) return missingAuthorityContext("workspaceId");
+      if (context.runId === undefined) return missingAuthorityContext("runId");
+      if (context.productTurnId === undefined) return missingAuthorityContext("productTurnId");
+      return resolvedAuthority(
+        command.type,
+        context.runId,
+        context.workspaceId,
+        command.sessionId,
+        context.runId,
+        context.productTurnId,
+      );
+    default: {
+      const exhaustive: never = command;
+      return exhaustive;
+    }
+  }
+}
+
 export const ThemeChangedPayloadSchema = closed({ theme: ThemeSettingSchema });
 export const WorkspaceChangedPayloadSchema = closed({
   change: WorkspaceChangeSchema,
