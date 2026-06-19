@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, realpath } from "node:fs/promises";
-import { basename, join, relative } from "node:path";
+import { lstat, mkdir, open, realpath } from "node:fs/promises";
+import { basename, isAbsolute, join, relative } from "node:path";
 import { PersistenceError, persistenceError } from "./errors.js";
 import {
   injectFault,
@@ -162,13 +162,10 @@ export class DurableJsonl<T> {
   ): Promise<QuarantinedJsonlTail> {
     try {
       const requestedDirectory = join(sourceDirectory, `${basename(sourcePath)}.quarantine`);
-      await mkdir(requestedDirectory, { mode: 0o700, recursive: true });
-      const quarantineDirectory = await realpath(requestedDirectory);
-      await chmod(quarantineDirectory, 0o700);
-      const relation = relative(sourceDirectory, quarantineDirectory);
-      if (relation.startsWith("..") || relation === "" || relation.startsWith("/")) {
-        throw new PersistenceError("unsafe_symbolic_link");
-      }
+      const quarantineDirectory = await this.#prepareQuarantineDirectory(
+        sourceDirectory,
+        requestedDirectory,
+      );
       const primaryDigest =
         this.#options.quarantinePrimaryDigest?.(source) ??
         createHash("sha256").update("yaca:source-primary\0").update(source).digest("hex");
@@ -197,6 +194,7 @@ export class DurableJsonl<T> {
           constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
           0o600,
         );
+        await handle.chmod(0o600);
         await injectFault(this.#options.faultInjector, "quarantine-write");
         await handle.writeFile(tail);
         await handle.sync();
@@ -219,6 +217,62 @@ export class DurableJsonl<T> {
     }
   }
 
+  async #prepareQuarantineDirectory(
+    sourceDirectory: string,
+    requestedDirectory: string,
+  ): Promise<string> {
+    let candidate;
+    try {
+      candidate = await lstat(requestedDirectory, { bigint: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      try {
+        await mkdir(requestedDirectory, { mode: 0o700 });
+      } catch (mkdirError) {
+        if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
+      }
+      candidate = await lstat(requestedDirectory, { bigint: true });
+    }
+
+    if (candidate.isSymbolicLink()) throw new PersistenceError("unsafe_symbolic_link");
+    if (!candidate.isDirectory()) throw new PersistenceError("io_failure");
+    const owner = process.getuid?.();
+    if (
+      (candidate.mode & 0o777n) !== 0o700n ||
+      (owner !== undefined && candidate.uid !== BigInt(owner))
+    ) {
+      throw new PersistenceError("io_failure");
+    }
+    const quarantineDirectory = await realpath(requestedDirectory);
+    const relation = relative(sourceDirectory, quarantineDirectory);
+    if (relation.startsWith("..") || relation === "" || isAbsolute(relation)) {
+      throw new PersistenceError("unsafe_symbolic_link");
+    }
+    const verified = await lstat(requestedDirectory, { bigint: true });
+    if (
+      !verified.isDirectory() ||
+      verified.dev !== candidate.dev ||
+      verified.ino !== candidate.ino ||
+      (verified.mode & 0o777n) !== 0o700n ||
+      (owner !== undefined && verified.uid !== BigInt(owner))
+    ) {
+      throw new PersistenceError("io_failure");
+    }
+    await injectFault(this.#options.faultInjector, "quarantine-directory-verified");
+    const finalIdentity = await lstat(requestedDirectory, { bigint: true });
+    if (finalIdentity.isSymbolicLink()) throw new PersistenceError("unsafe_symbolic_link");
+    if (
+      !finalIdentity.isDirectory() ||
+      finalIdentity.dev !== verified.dev ||
+      finalIdentity.ino !== verified.ino ||
+      (finalIdentity.mode & 0o777n) !== 0o700n ||
+      (owner !== undefined && finalIdentity.uid !== BigInt(owner))
+    ) {
+      throw new PersistenceError("io_failure");
+    }
+    return quarantineDirectory;
+  }
+
   async #readEvidence(
     path: string,
     expectedBytes: Buffer,
@@ -229,11 +283,27 @@ export class DurableJsonl<T> {
       const candidate = await lstat(path, { bigint: true });
       if (candidate.isSymbolicLink()) throw new PersistenceError("unsafe_symbolic_link");
       if (!candidate.isFile()) throw new PersistenceError("io_failure");
+      const owner = process.getuid?.();
+      if (
+        candidate.nlink !== 1n ||
+        (candidate.mode & 0o777n) !== 0o600n ||
+        (owner !== undefined && candidate.uid !== BigInt(owner))
+      ) {
+        throw new PersistenceError("io_failure");
+      }
       handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       const opened = await handle.stat({ bigint: true });
-      if (!opened.isFile()) throw new PersistenceError("io_failure");
-      await handle.chmod(0o600);
-      const before = await handle.stat({ bigint: true });
+      if (
+        !opened.isFile() ||
+        opened.dev !== candidate.dev ||
+        opened.ino !== candidate.ino ||
+        opened.nlink !== 1n ||
+        (opened.mode & 0o777n) !== 0o600n ||
+        (owner !== undefined && opened.uid !== BigInt(owner))
+      ) {
+        throw new PersistenceError("io_failure");
+      }
+      const before = opened;
       const bytes = await handle.readFile();
       const after = await handle.stat({ bigint: true });
       if (
@@ -242,6 +312,9 @@ export class DurableJsonl<T> {
         before.size !== after.size ||
         before.mtimeNs !== after.mtimeNs ||
         before.ctimeNs !== after.ctimeNs ||
+        after.nlink !== 1n ||
+        (after.mode & 0o777n) !== 0o600n ||
+        (owner !== undefined && after.uid !== BigInt(owner)) ||
         !bytes.equals(expectedBytes)
       ) {
         throw new PersistenceError("io_failure");
@@ -257,7 +330,10 @@ export class DurableJsonl<T> {
       if (
         !pathIdentity.isFile() ||
         pathIdentity.dev !== after.dev ||
-        pathIdentity.ino !== after.ino
+        pathIdentity.ino !== after.ino ||
+        pathIdentity.nlink !== 1n ||
+        (pathIdentity.mode & 0o777n) !== 0o600n ||
+        (owner !== undefined && pathIdentity.uid !== BigInt(owner))
       ) {
         throw new PersistenceError("io_failure");
       }

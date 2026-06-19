@@ -10,6 +10,7 @@ export type PersistenceOperation =
   | "rename"
   | "directory-fsync"
   | "quarantine-write"
+  | "quarantine-directory-verified"
   | "quarantine-verified";
 
 export type PersistenceFaultInjector = (operation: PersistenceOperation) => void | Promise<void>;
