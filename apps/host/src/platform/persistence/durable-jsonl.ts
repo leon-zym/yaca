@@ -1,48 +1,53 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, mkdir, open, realpath } from "node:fs/promises";
-import { basename, isAbsolute, join, relative } from "node:path";
+import { constants, type BigIntStats } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import { PersistenceError, persistenceError } from "./errors.js";
 import {
   injectFault,
   parseJson,
   type PersistenceOptions,
+  resolveReadOnlyTarget,
   resolveTarget,
   serializeJson,
   syncDirectory,
 } from "./filesystem.js";
 
-export interface QuarantinedJsonlTail {
+const MAX_LEDGER_READ_BYTES = 268_435_456;
+const MAX_CORRUPT_TAIL_BYTES = MAX_LEDGER_READ_BYTES;
+
+interface LedgerIdentity {
+  readonly device: bigint;
+  readonly inode: bigint;
+  readonly user: bigint;
+  readonly links: bigint;
+  readonly mode: bigint;
+  readonly size: bigint;
+  readonly modifiedAt: bigint;
+  readonly changedAt: bigint;
+}
+
+export interface CorruptTailEvidence {
   readonly id: string;
   readonly byteLength: number;
   readonly read: () => Promise<Buffer>;
 }
 
-interface EvidenceFileIdentity {
-  device: bigint;
-  inode: bigint;
-}
-
 export interface JsonlReadResult<T> {
   records: T[];
-  quarantinedTail: QuarantinedJsonlTail | null;
+  corruptTail: CorruptTailEvidence | null;
 }
 
 export type DurableJsonlStatus = "healthy" | "degraded";
 
-export interface DurableJsonlOptions<T> extends PersistenceOptions<T> {
-  quarantinePrimaryDigest?: (source: Uint8Array) => string;
-}
-
 export class DurableJsonl<T> {
   readonly #requestedPath: string;
-  readonly #options: DurableJsonlOptions<T>;
+  readonly #options: PersistenceOptions<T>;
   #degradedResult: JsonlReadResult<T> | undefined;
   #inspected = false;
   #queue: Promise<void> = Promise.resolve();
   #status: DurableJsonlStatus = "healthy";
 
-  constructor(path: string, options: DurableJsonlOptions<T> = {}) {
+  constructor(path: string, options: PersistenceOptions<T> = {}) {
     this.#requestedPath = path;
     this.#options = options;
   }
@@ -67,18 +72,35 @@ export class DurableJsonl<T> {
 
   async #readValidPrefix(): Promise<JsonlReadResult<T>> {
     if (this.#degradedResult) return this.#degradedResult;
-    const target = await resolveTarget(this.#requestedPath);
+    const target = await resolveReadOnlyTarget(this.#requestedPath);
     let handle;
     let bytes: Buffer;
+    let identity: LedgerIdentity;
     try {
-      handle = await open(target.path, constants.O_RDONLY | constants.O_NOFOLLOW);
-      await handle.chmod(0o600);
+      const pathBefore = await lstat(target.path, { bigint: true });
+      this.#assertSafeLedger(pathBefore);
+      handle = await open(
+        target.path,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      const before = await handle.stat({ bigint: true });
+      this.#assertSafeLedger(before);
+      this.#assertSameLedger(pathBefore, before);
+      if (before.size > BigInt(MAX_LEDGER_READ_BYTES)) {
+        throw new PersistenceError("content_too_large");
+      }
       await injectFault(this.#options.faultInjector, "read");
       bytes = await handle.readFile();
+      const after = await handle.stat({ bigint: true });
+      this.#assertSameLedger(before, after);
+      if (after.size !== BigInt(bytes.byteLength)) throw new PersistenceError("io_failure");
+      const pathAfter = await lstat(target.path, { bigint: true });
+      this.#assertSameLedger(after, pathAfter);
+      identity = this.#identity(after);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         this.#inspected = true;
-        return { records: [], quarantinedTail: null };
+        return { records: [], corruptTail: null };
       }
       throw persistenceError(error);
     } finally {
@@ -100,16 +122,23 @@ export class DurableJsonl<T> {
     }
 
     this.#inspected = true;
-    if (offset === bytes.length) return { records, quarantinedTail: null };
+    if (offset === bytes.length) return { records, corruptTail: null };
     this.#status = "degraded";
-    const quarantinedTail = await this.#quarantine(
-      target.directory,
-      target.path,
-      bytes,
-      offset,
-      bytes.subarray(offset),
-    );
-    this.#degradedResult = { records, quarantinedTail };
+    const tail = bytes.subarray(offset);
+    const tailDigest = createHash("sha256").update(tail).digest("hex");
+    const id = createHash("sha256")
+      .update("yaca:corrupt-tail:v1\0")
+      .update(createHash("sha256").update(bytes).digest())
+      .update(String(offset))
+      .update("\0")
+      .update(tailDigest)
+      .digest("hex");
+    const corruptTail = Object.freeze({
+      id,
+      byteLength: tail.byteLength,
+      read: () => this.#readCorruptTail(target.path, identity, offset, tail.byteLength, tailDigest),
+    });
+    this.#degradedResult = { records, corruptTail };
     return this.#degradedResult;
   }
 
@@ -153,195 +182,103 @@ export class DurableJsonl<T> {
     }
   }
 
-  async #quarantine(
-    sourceDirectory: string,
-    sourcePath: string,
-    source: Buffer,
-    validPrefixByteLength: number,
-    tail: Buffer,
-  ): Promise<QuarantinedJsonlTail> {
-    try {
-      const requestedDirectory = join(sourceDirectory, `${basename(sourcePath)}.quarantine`);
-      const quarantineDirectory = await this.#prepareQuarantineDirectory(
-        sourceDirectory,
-        requestedDirectory,
-      );
-      const primaryDigest =
-        this.#options.quarantinePrimaryDigest?.(source) ??
-        createHash("sha256").update("yaca:source-primary\0").update(source).digest("hex");
-      const identity = JSON.stringify({
-        version: 1,
-        primaryDigest,
-        secondaryDigest: createHash("sha512")
-          .update("yaca:source-secondary\0")
-          .update(source)
-          .digest("hex"),
-        sourceByteLength: source.byteLength,
-        validPrefixByteLength,
-        validPrefixDigest: createHash("sha256")
-          .update("yaca:valid-prefix\0")
-          .update(source.subarray(0, validPrefixByteLength))
-          .digest("hex"),
-        tailByteLength: tail.byteLength,
-        tailDigest: createHash("sha256").update("yaca:tail\0").update(tail).digest("hex"),
-      });
-      const id = createHash("sha256").update(identity).digest("hex");
-      const quarantinePath = join(quarantineDirectory, `tail-${id}.jsonl`);
-      let handle;
-      try {
-        handle = await open(
-          quarantinePath,
-          constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
-          0o600,
-        );
-        await handle.chmod(0o600);
-        await injectFault(this.#options.faultInjector, "quarantine-write");
-        await handle.writeFile(tail);
-        await handle.sync();
-        await handle.close();
-        handle = undefined;
-        await syncDirectory(quarantineDirectory);
-      } catch (error) {
-        await handle?.close();
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      }
-      const verified = await this.#readEvidence(quarantinePath, tail);
-      return Object.freeze({
-        id,
-        byteLength: tail.byteLength,
-        read: () =>
-          this.#readEvidence(quarantinePath, tail, verified.identity).then(({ bytes }) => bytes),
-      });
-    } catch (error) {
-      throw persistenceError(error);
-    }
-  }
-
-  async #prepareQuarantineDirectory(
-    sourceDirectory: string,
-    requestedDirectory: string,
-  ): Promise<string> {
-    let candidate;
-    try {
-      candidate = await lstat(requestedDirectory, { bigint: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      try {
-        await mkdir(requestedDirectory, { mode: 0o700 });
-      } catch (mkdirError) {
-        if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") throw mkdirError;
-      }
-      candidate = await lstat(requestedDirectory, { bigint: true });
-    }
-
-    if (candidate.isSymbolicLink()) throw new PersistenceError("unsafe_symbolic_link");
-    if (!candidate.isDirectory()) throw new PersistenceError("io_failure");
-    const owner = process.getuid?.();
-    if (
-      (candidate.mode & 0o777n) !== 0o700n ||
-      (owner !== undefined && candidate.uid !== BigInt(owner))
-    ) {
-      throw new PersistenceError("io_failure");
-    }
-    const quarantineDirectory = await realpath(requestedDirectory);
-    const relation = relative(sourceDirectory, quarantineDirectory);
-    if (relation.startsWith("..") || relation === "" || isAbsolute(relation)) {
-      throw new PersistenceError("unsafe_symbolic_link");
-    }
-    const verified = await lstat(requestedDirectory, { bigint: true });
-    if (
-      !verified.isDirectory() ||
-      verified.dev !== candidate.dev ||
-      verified.ino !== candidate.ino ||
-      (verified.mode & 0o777n) !== 0o700n ||
-      (owner !== undefined && verified.uid !== BigInt(owner))
-    ) {
-      throw new PersistenceError("io_failure");
-    }
-    await injectFault(this.#options.faultInjector, "quarantine-directory-verified");
-    const finalIdentity = await lstat(requestedDirectory, { bigint: true });
-    if (finalIdentity.isSymbolicLink()) throw new PersistenceError("unsafe_symbolic_link");
-    if (
-      !finalIdentity.isDirectory() ||
-      finalIdentity.dev !== verified.dev ||
-      finalIdentity.ino !== verified.ino ||
-      (finalIdentity.mode & 0o777n) !== 0o700n ||
-      (owner !== undefined && finalIdentity.uid !== BigInt(owner))
-    ) {
-      throw new PersistenceError("io_failure");
-    }
-    return quarantineDirectory;
-  }
-
-  async #readEvidence(
+  async #readCorruptTail(
     path: string,
-    expectedBytes: Buffer,
-    expectedIdentity?: EvidenceFileIdentity,
-  ): Promise<{ bytes: Buffer; identity: EvidenceFileIdentity }> {
+    expected: LedgerIdentity,
+    offset: number,
+    byteLength: number,
+    expectedDigest: string,
+  ): Promise<Buffer> {
+    if (byteLength > MAX_CORRUPT_TAIL_BYTES) {
+      throw new PersistenceError("content_too_large");
+    }
     let handle;
     try {
-      const candidate = await lstat(path, { bigint: true });
-      if (candidate.isSymbolicLink()) throw new PersistenceError("unsafe_symbolic_link");
-      if (!candidate.isFile()) throw new PersistenceError("io_failure");
-      const owner = process.getuid?.();
-      if (
-        candidate.nlink !== 1n ||
-        (candidate.mode & 0o777n) !== 0o600n ||
-        (owner !== undefined && candidate.uid !== BigInt(owner))
-      ) {
-        throw new PersistenceError("io_failure");
-      }
+      const pathBefore = await lstat(path, { bigint: true });
+      this.#assertIdentity(expected, pathBefore);
       handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-      const opened = await handle.stat({ bigint: true });
-      if (
-        !opened.isFile() ||
-        opened.dev !== candidate.dev ||
-        opened.ino !== candidate.ino ||
-        opened.nlink !== 1n ||
-        (opened.mode & 0o777n) !== 0o600n ||
-        (owner !== undefined && opened.uid !== BigInt(owner))
-      ) {
-        throw new PersistenceError("io_failure");
+      const before = await handle.stat({ bigint: true });
+      this.#assertIdentity(expected, before);
+      const bytes = Buffer.alloc(byteLength);
+      let readOffset = 0;
+      while (readOffset < byteLength) {
+        const { bytesRead } = await handle.read(
+          bytes,
+          readOffset,
+          byteLength - readOffset,
+          offset + readOffset,
+        );
+        if (bytesRead === 0) throw new PersistenceError("io_failure");
+        readOffset += bytesRead;
       }
-      const before = opened;
-      const bytes = await handle.readFile();
       const after = await handle.stat({ bigint: true });
-      if (
-        before.dev !== after.dev ||
-        before.ino !== after.ino ||
-        before.size !== after.size ||
-        before.mtimeNs !== after.mtimeNs ||
-        before.ctimeNs !== after.ctimeNs ||
-        after.nlink !== 1n ||
-        (after.mode & 0o777n) !== 0o600n ||
-        (owner !== undefined && after.uid !== BigInt(owner)) ||
-        !bytes.equals(expectedBytes)
-      ) {
+      this.#assertIdentity(expected, after);
+      if (createHash("sha256").update(bytes).digest("hex") !== expectedDigest) {
         throw new PersistenceError("io_failure");
       }
-      if (
-        expectedIdentity &&
-        (expectedIdentity.device !== after.dev || expectedIdentity.inode !== after.ino)
-      ) {
-        throw new PersistenceError("io_failure");
-      }
-      await injectFault(this.#options.faultInjector, "quarantine-verified");
-      const pathIdentity = await lstat(path, { bigint: true });
-      if (
-        !pathIdentity.isFile() ||
-        pathIdentity.dev !== after.dev ||
-        pathIdentity.ino !== after.ino ||
-        pathIdentity.nlink !== 1n ||
-        (pathIdentity.mode & 0o777n) !== 0o600n ||
-        (owner !== undefined && pathIdentity.uid !== BigInt(owner))
-      ) {
-        throw new PersistenceError("io_failure");
-      }
-      return { bytes, identity: { device: after.dev, inode: after.ino } };
+      await injectFault(this.#options.faultInjector, "corrupt-tail-verified");
+      const pathAfter = await lstat(path, { bigint: true });
+      this.#assertIdentity(expected, pathAfter);
+      return bytes;
     } catch (error) {
       throw persistenceError(error);
     } finally {
       await handle?.close();
+    }
+  }
+
+  #assertSafeLedger(stat: BigIntStats): void {
+    if (stat.isSymbolicLink()) throw new PersistenceError("unsafe_symbolic_link");
+    const owner = process.getuid?.();
+    if (
+      !stat.isFile() ||
+      stat.nlink !== 1n ||
+      (stat.mode & 0o777n) !== 0o600n ||
+      (owner !== undefined && stat.uid !== BigInt(owner))
+    ) {
+      throw new PersistenceError("io_failure");
+    }
+  }
+
+  #assertSameLedger(expected: BigIntStats, actual: BigIntStats): void {
+    this.#assertSafeLedger(actual);
+    if (
+      expected.dev !== actual.dev ||
+      expected.ino !== actual.ino ||
+      expected.size !== actual.size ||
+      expected.mtimeNs !== actual.mtimeNs ||
+      expected.ctimeNs !== actual.ctimeNs
+    ) {
+      throw new PersistenceError("io_failure");
+    }
+  }
+
+  #identity(stat: BigIntStats): LedgerIdentity {
+    return {
+      device: stat.dev,
+      inode: stat.ino,
+      user: stat.uid,
+      links: stat.nlink,
+      mode: stat.mode & 0o777n,
+      size: stat.size,
+      modifiedAt: stat.mtimeNs,
+      changedAt: stat.ctimeNs,
+    };
+  }
+
+  #assertIdentity(expected: LedgerIdentity, actual: BigIntStats): void {
+    this.#assertSafeLedger(actual);
+    if (
+      expected.device !== actual.dev ||
+      expected.inode !== actual.ino ||
+      expected.user !== actual.uid ||
+      expected.links !== actual.nlink ||
+      expected.mode !== (actual.mode & 0o777n) ||
+      expected.size !== actual.size ||
+      expected.modifiedAt !== actual.mtimeNs ||
+      expected.changedAt !== actual.ctimeNs
+    ) {
+      throw new PersistenceError("io_failure");
     }
   }
 }

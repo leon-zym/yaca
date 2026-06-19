@@ -4,13 +4,12 @@ export {
   AtomicJsonFile,
   DurableJsonl,
   PersistenceError,
-  type DurableJsonlOptions,
+  type CorruptTailEvidence,
   type DurableJsonlStatus,
   type JsonlReadResult,
   type PersistenceErrorCode,
   type PersistenceFaultInjector,
   type PersistenceOperation,
   type PersistenceOptions,
-  type QuarantinedJsonlTail,
 } from "./platform/persistence/index.js";
 export { YACA_VERSION } from "./version.js";

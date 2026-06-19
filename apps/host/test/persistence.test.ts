@@ -8,6 +8,7 @@ import {
   readdir,
   rename,
   symlink,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -139,7 +140,7 @@ describe("DurableJsonl", () => {
 
     await expect(ledger.readValidPrefix()).resolves.toMatchObject({
       records: Array.from({ length: 24 }, (_, sequence) => ({ sequence })),
-      quarantinedTail: null,
+      corruptTail: null,
     });
     expect((await lstat(target)).mode & 0o777).toBe(0o600);
   });
@@ -175,7 +176,7 @@ describe("DurableJsonl", () => {
     expect(writeEntered).toBe(true);
   });
 
-  test("does not expose or quarantine a written line before its fsync completes", async () => {
+  test("does not expose a written line before its fsync completes", async () => {
     const directory = await temporaryDirectory("yaca-jsonl-fsync-barrier-");
     const target = join(directory, "events.jsonl");
     const fsyncEntered = deferred();
@@ -205,11 +206,9 @@ describe("DurableJsonl", () => {
     await expect(appending).resolves.toBeUndefined();
     await expect(reading).resolves.toEqual({
       records: [{ sequence: 1 }],
-      quarantinedTail: null,
+      corruptTail: null,
     });
-    await expect(readdir(join(directory, "events.jsonl.quarantine"))).rejects.toMatchObject({
-      code: "ENOENT",
-    });
+    expect(await readdir(directory)).toEqual(["events.jsonl"]);
   });
 
   test("linearizes 32 interleaved appends and reads in call order", async () => {
@@ -225,7 +224,7 @@ describe("DurableJsonl", () => {
           expect(result.records).toEqual(
             Array.from({ length: sequence + 1 }, (_, current) => ({ sequence: current })),
           );
-          expect(result.quarantinedTail).toBeNull();
+          expect(result.corruptTail).toBeNull();
         }),
       );
     }
@@ -302,363 +301,161 @@ describe("DurableJsonl", () => {
     ["torn", Buffer.from('{"sequence":')],
     ["corrupt", Buffer.from('not-json\n{"sequence":3}\n')],
   ])(
-    "returns the ordered valid prefix and quarantines a %s tail without mutation",
+    "returns the ordered valid prefix and logical evidence for a %s tail without filesystem mutation",
     async (_, tail) => {
       const directory = await temporaryDirectory("yaca-jsonl-tail-");
       const target = join(directory, "events.jsonl");
       const prefix = Buffer.from('{"sequence":1}\n{"sequence":2}\n');
       const original = Buffer.concat([prefix, tail]);
       await writeFile(target, original, { mode: 0o600 });
+      const entriesBefore = await readdir(directory);
+      const statBefore = await lstat(target);
       const ledger = new DurableJsonl<{ sequence: number }>(target);
 
       const first = await ledger.readValidPrefix();
 
       expect(first.records).toEqual([{ sequence: 1 }, { sequence: 2 }]);
-      expect(first.quarantinedTail?.byteLength).toBe(tail.byteLength);
-      await expect(first.quarantinedTail!.read()).resolves.toEqual(tail);
-      const quarantineDirectory = join(directory, "events.jsonl.quarantine");
-      const [quarantineName] = await readdir(quarantineDirectory);
-      expect((await lstat(join(quarantineDirectory, quarantineName!))).mode & 0o777).toBe(0o600);
+      expect(first.corruptTail?.byteLength).toBe(tail.byteLength);
+      await expect(first.corruptTail!.read()).resolves.toEqual(tail);
       expect(ledger.status).toBe("degraded");
       await expect(ledger.append({ sequence: 3 })).rejects.toMatchObject({ code: "degraded" });
 
       const second = await ledger.readValidPrefix();
       const reopened = await new DurableJsonl<{ sequence: number }>(target).readValidPrefix();
 
-      expect(second.quarantinedTail?.id).toBe(first.quarantinedTail?.id);
-      expect(reopened.quarantinedTail?.id).toBe(first.quarantinedTail?.id);
-      expect(await readdir(quarantineDirectory)).toHaveLength(1);
-      await expect(first.quarantinedTail!.read()).resolves.toEqual(tail);
+      expect(second.corruptTail?.id).toBe(first.corruptTail?.id);
+      expect(reopened.corruptTail?.id).toBe(first.corruptTail?.id);
+      expect(await readdir(directory)).toEqual(entriesBefore);
+      const statAfter = await lstat(target);
+      expect(statAfter.ino).toBe(statBefore.ino);
+      expect(statAfter.mode).toBe(statBefore.mode);
+      expect(statAfter.size).toBe(statBefore.size);
+      expect(statAfter.nlink).toBe(statBefore.nlink);
       await expect(readFile(target)).resolves.toEqual(original);
     },
   );
 
-  test("does not overwrite or reuse mismatched quarantine evidence", async () => {
-    const directory = await temporaryDirectory("yaca-jsonl-quarantine-conflict-");
+  test("rejects a corrupt-tail descriptor after the ledger inode is replaced", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-ledger-replaced-");
     const target = join(directory, "events.jsonl");
     const original = Buffer.from('{"sequence":1}\n{"sequence":');
     await writeFile(target, original, { mode: 0o600 });
-    await new DurableJsonl<{ sequence: number }>(target).readValidPrefix();
-    const quarantineDirectory = join(directory, "events.jsonl.quarantine");
-    const [quarantineName] = await readdir(quarantineDirectory);
-    const quarantinePath = join(quarantineDirectory, quarantineName!);
-    const mismatchedEvidence = Buffer.from("mismatched quarantine evidence");
-    await writeFile(quarantinePath, mismatchedEvidence);
-    const reopened = new DurableJsonl<{ sequence: number }>(target);
-
-    await expect(reopened.readValidPrefix()).rejects.toMatchObject({ code: "io_failure" });
-
-    expect(reopened.status).toBe("degraded");
-    await expect(readFile(quarantinePath)).resolves.toEqual(mismatchedEvidence);
-    await expect(readFile(target)).resolves.toEqual(original);
-    expect(await readdir(join(directory, "events.jsonl.quarantine"))).toHaveLength(1);
-  });
-
-  test("separates different source prefixes when the primary digest collides", async () => {
-    const directory = await temporaryDirectory("yaca-jsonl-primary-collision-");
-    const target = join(directory, "events.jsonl");
-    const tail = Buffer.from('{"sequence":');
-    const sourceA = Buffer.concat([Buffer.from('{"source":"A"}\n'), tail]);
-    const sourceB = Buffer.concat([Buffer.from('{"source":"B"}\n'), tail]);
-    const options = { quarantinePrimaryDigest: () => "forced-primary-collision" };
-    await writeFile(target, sourceA, { mode: 0o600 });
-    const evidenceA = (
-      await new DurableJsonl<{ source: string }>(target, options).readValidPrefix()
-    ).quarantinedTail!;
-    await writeFile(target, sourceB, { mode: 0o600 });
-    const evidenceB = (
-      await new DurableJsonl<{ source: string }>(target, options).readValidPrefix()
-    ).quarantinedTail!;
-
-    expect(evidenceA.id).not.toBe(evidenceB.id);
-    await expect(evidenceA.read()).resolves.toEqual(tail);
-    await expect(evidenceB.read()).resolves.toEqual(tail);
-    expect(await readdir(join(directory, "events.jsonl.quarantine"))).toHaveLength(2);
-    await expect(readFile(target)).resolves.toEqual(sourceB);
-  });
-
-  test("rejects evidence replaced with an identical file after the descriptor is issued", async () => {
-    const directory = await temporaryDirectory("yaca-jsonl-evidence-replacement-");
-    const target = join(directory, "events.jsonl");
-    const tail = Buffer.from('{"sequence":');
-    await writeFile(target, Buffer.concat([Buffer.from('{"sequence":1}\n'), tail]), {
-      mode: 0o600,
-    });
     const evidence = (await new DurableJsonl<{ sequence: number }>(target).readValidPrefix())
-      .quarantinedTail!;
-    const quarantineDirectory = join(directory, "events.jsonl.quarantine");
-    const [quarantineName] = await readdir(quarantineDirectory);
-    const quarantinePath = join(quarantineDirectory, quarantineName!);
-    const originalEvidencePath = join(quarantineDirectory, "original-evidence");
-    await rename(quarantinePath, originalEvidencePath);
-    await writeFile(quarantinePath, tail, { mode: 0o600 });
+      .corruptTail!;
+    const originalPath = join(directory, "original-events.jsonl");
+    await rename(target, originalPath);
+    await writeFile(target, original, { mode: 0o600 });
+
+    await expect(evidence.read()).rejects.toMatchObject({ code: "io_failure" });
+    await expect(readFile(originalPath)).resolves.toEqual(original);
+    await expect(readFile(target)).resolves.toEqual(original);
+  });
+
+  test("rejects a corrupt-tail descriptor when the ledger gains a hard link", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-ledger-hardlink-");
+    const target = join(directory, "events.jsonl");
+    const original = Buffer.from('{"sequence":1}\n{"sequence":');
+    await writeFile(target, original, { mode: 0o600 });
+    const evidence = (await new DurableJsonl<{ sequence: number }>(target).readValidPrefix())
+      .corruptTail!;
+    const linkedPath = join(directory, "linked-events.jsonl");
+    await link(target, linkedPath);
+    const before = await lstat(target);
 
     await expect(evidence.read()).rejects.toMatchObject({ code: "io_failure" });
 
-    await expect(readFile(originalEvidencePath)).resolves.toEqual(tail);
-    await expect(readFile(quarantinePath)).resolves.toEqual(tail);
+    const after = await lstat(target);
+    expect(after.ino).toBe(before.ino);
+    expect(after.nlink).toBe(2);
+    expect(after.mode & 0o777).toBe(0o600);
+    await expect(readFile(target)).resolves.toEqual(original);
+    await expect(readFile(linkedPath)).resolves.toEqual(original);
   });
 
-  test("rejects inode replacement in the existing-evidence verification window", async () => {
-    const directory = await temporaryDirectory("yaca-jsonl-evidence-toctou-");
+  test("rejects a corrupt-tail descriptor after the ledger bytes change in place", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-ledger-modified-");
     const target = join(directory, "events.jsonl");
-    const tail = Buffer.from('{"sequence":');
-    const source = Buffer.concat([Buffer.from('{"sequence":1}\n'), tail]);
-    await writeFile(target, source, { mode: 0o600 });
-    await new DurableJsonl<{ sequence: number }>(target).readValidPrefix();
-    const quarantineDirectory = join(directory, "events.jsonl.quarantine");
-    const [quarantineName] = await readdir(quarantineDirectory);
-    const quarantinePath = join(quarantineDirectory, quarantineName!);
-    const verified = deferred();
-    const releaseVerification = deferred();
-    let blockVerification = true;
-    const reopened = new DurableJsonl<{ sequence: number }>(target, {
-      faultInjector: async (operation) => {
-        if (operation === "quarantine-verified" && blockVerification) {
-          blockVerification = false;
-          verified.resolve();
-          await releaseVerification.promise;
-        }
-      },
+    const original = Buffer.from('{"sequence":1}\n{"sequence":');
+    await writeFile(target, original, { mode: 0o600 });
+    const evidence = (await new DurableJsonl<{ sequence: number }>(target).readValidPrefix())
+      .corruptTail!;
+    const modified = Buffer.concat([original, Buffer.from("changed")]);
+    await writeFile(target, modified, { mode: 0o600 });
+
+    await expect(evidence.read()).rejects.toMatchObject({ code: "io_failure" });
+    await expect(readFile(target)).resolves.toEqual(modified);
+    expect(await readdir(directory)).toEqual(["events.jsonl"]);
+  });
+
+  test("does not follow a symbolic-link ledger when corrupt-tail evidence is read", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-ledger-evidence-link-");
+    const target = join(directory, "events.jsonl");
+    const original = Buffer.from('{"sequence":1}\n{"sequence":');
+    await writeFile(target, original, { mode: 0o600 });
+    const evidence = (await new DurableJsonl<{ sequence: number }>(target).readValidPrefix())
+      .corruptTail!;
+    const originalPath = join(directory, "original-events.jsonl");
+    await rename(target, originalPath);
+    await symlink(originalPath, target);
+
+    await expect(evidence.read()).rejects.toMatchObject({ code: "unsafe_symbolic_link" });
+    await expect(readFile(originalPath)).resolves.toEqual(original);
+  });
+
+  test("rejects an oversized ledger before allocating its corrupt tail", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-ledger-limit-");
+    const target = join(directory, "events.jsonl");
+    await writeFile(target, "not-json", { mode: 0o600 });
+    await truncate(target, 268_435_457);
+
+    await expect(new DurableJsonl(target).readValidPrefix()).rejects.toMatchObject({
+      code: "content_too_large",
     });
 
-    const reading = reopened.readValidPrefix();
-    await verified.promise;
-    const originalEvidencePath = join(quarantineDirectory, "original-evidence");
-    await rename(quarantinePath, originalEvidencePath);
-    await writeFile(quarantinePath, tail, { mode: 0o600 });
-    releaseVerification.resolve();
-
-    await expect(reading).rejects.toMatchObject({ code: "io_failure" });
-    expect(reopened.status).toBe("degraded");
-    await expect(readFile(target)).resolves.toEqual(source);
-    await expect(readFile(originalEvidencePath)).resolves.toEqual(tail);
-    await expect(readFile(quarantinePath)).resolves.toEqual(tail);
+    expect((await lstat(target)).size).toBe(268_435_457);
+    expect(await readdir(directory)).toEqual(["events.jsonl"]);
   });
 
-  test("does not follow a symbolic-link quarantine candidate", async () => {
-    const directory = await temporaryDirectory("yaca-jsonl-evidence-symlink-");
-    const target = join(directory, "events.jsonl");
-    const tail = Buffer.from('{"sequence":');
-    const source = Buffer.concat([Buffer.from('{"sequence":1}\n'), tail]);
-    await writeFile(target, source, { mode: 0o600 });
-    await new DurableJsonl<{ sequence: number }>(target).readValidPrefix();
-    const quarantineDirectory = join(directory, "events.jsonl.quarantine");
-    const [quarantineName] = await readdir(quarantineDirectory);
-    const quarantinePath = join(quarantineDirectory, quarantineName!);
-    const originalEvidencePath = join(quarantineDirectory, "original-evidence");
-    const linkedTarget = join(directory, "linked-evidence");
-    await rename(quarantinePath, originalEvidencePath);
-    await writeFile(linkedTarget, tail, { mode: 0o600 });
-    await symlink(linkedTarget, quarantinePath);
-    const reopened = new DurableJsonl<{ sequence: number }>(target);
-
-    await expect(reopened.readValidPrefix()).rejects.toMatchObject({
-      code: "unsafe_symbolic_link",
-    });
-
-    await expect(readFile(linkedTarget)).resolves.toEqual(tail);
-    await expect(readFile(originalEvidencePath)).resolves.toEqual(tail);
-    await expect(readFile(target)).resolves.toEqual(source);
-  });
-
-  test("rejects a symbolic-link quarantine directory without changing its external target", async () => {
-    const root = await temporaryDirectory("yaca-jsonl-directory-symlink-");
-    const journalDirectory = join(root, "journal");
-    const externalDirectory = join(root, "external");
-    await mkdir(journalDirectory, { mode: 0o700 });
-    await mkdir(externalDirectory, { mode: 0o755 });
-    await chmod(externalDirectory, 0o755);
-    const marker = join(externalDirectory, "marker.txt");
-    await writeFile(marker, "external data must remain unchanged", { mode: 0o644 });
-    const before = await lstat(externalDirectory);
-    const target = join(journalDirectory, "events.jsonl");
-    const source = Buffer.from('{"sequence":1}\n{"sequence":');
-    await writeFile(target, source, { mode: 0o600 });
-    await symlink(externalDirectory, join(journalDirectory, "events.jsonl.quarantine"));
-
-    await expect(
-      new DurableJsonl<{ sequence: number }>(target).readValidPrefix(),
-    ).rejects.toMatchObject({ code: "unsafe_symbolic_link" });
-
-    const after = await lstat(externalDirectory);
-    expect(after.ino).toBe(before.ino);
-    expect(after.mode & 0o777).toBe(0o755);
-    await expect(readFile(marker, "utf8")).resolves.toBe("external data must remain unchanged");
-    await expect(readFile(target)).resolves.toEqual(source);
-  });
-
-  test("rejects an existing quarantine directory with unsafe permissions without repairing it", async () => {
-    const directory = await temporaryDirectory("yaca-jsonl-directory-mode-");
-    const target = join(directory, "events.jsonl");
-    const quarantineDirectory = join(directory, "events.jsonl.quarantine");
-    await mkdir(quarantineDirectory, { mode: 0o755 });
-    await chmod(quarantineDirectory, 0o755);
-    const marker = join(quarantineDirectory, "marker.txt");
-    await writeFile(marker, "existing directory content", { mode: 0o644 });
-    const before = await lstat(quarantineDirectory);
-    const source = Buffer.from('{"sequence":1}\n{"sequence":');
-    await writeFile(target, source, { mode: 0o600 });
-
-    await expect(
-      new DurableJsonl<{ sequence: number }>(target).readValidPrefix(),
-    ).rejects.toMatchObject({ code: "io_failure" });
-
-    const after = await lstat(quarantineDirectory);
-    expect(after.ino).toBe(before.ino);
-    expect(after.mode & 0o777).toBe(0o755);
-    await expect(readFile(marker, "utf8")).resolves.toBe("existing directory content");
-    await expect(readFile(target)).resolves.toEqual(source);
-  });
-
-  test("rejects a quarantine directory swapped after containment verification", async () => {
-    const root = await temporaryDirectory("yaca-jsonl-directory-swap-");
+  test("rejects a parent swap during corrupt-tail verification without writing through it", async () => {
+    const root = await temporaryDirectory("yaca-jsonl-ledger-parent-swap-");
     const journalDirectory = join(root, "journal");
     const externalDirectory = join(root, "external");
     await mkdir(journalDirectory, { mode: 0o700 });
     await mkdir(externalDirectory, { mode: 0o700 });
-    const marker = join(externalDirectory, "marker.txt");
-    await writeFile(marker, "external directory", { mode: 0o644 });
-    const externalBefore = await lstat(externalDirectory);
     const target = join(journalDirectory, "events.jsonl");
-    const source = Buffer.from('{"sequence":1}\n{"sequence":');
-    await writeFile(target, source, { mode: 0o600 });
-    await new DurableJsonl<{ sequence: number }>(target).readValidPrefix();
-    const quarantineDirectory = join(journalDirectory, "events.jsonl.quarantine");
-    const originalDirectory = join(journalDirectory, "original-quarantine");
+    const externalTarget = join(externalDirectory, "events.jsonl");
+    const original = Buffer.from('{"sequence":1}\n{"sequence":');
+    await writeFile(target, original, { mode: 0o600 });
+    await writeFile(externalTarget, original, { mode: 0o600 });
+    const externalBefore = await lstat(externalTarget);
     const verified = deferred();
     const releaseVerification = deferred();
     let blockVerification = true;
-    const reopened = new DurableJsonl<{ sequence: number }>(target, {
+    const ledger = new DurableJsonl<{ sequence: number }>(target, {
       faultInjector: async (operation) => {
-        if (operation === "quarantine-directory-verified" && blockVerification) {
+        if (operation === "corrupt-tail-verified" && blockVerification) {
           blockVerification = false;
           verified.resolve();
           await releaseVerification.promise;
         }
       },
     });
+    const evidence = (await ledger.readValidPrefix()).corruptTail!;
 
-    const reading = reopened.readValidPrefix();
+    const reading = evidence.read();
     await verified.promise;
-    await rename(quarantineDirectory, originalDirectory);
-    await symlink(externalDirectory, quarantineDirectory);
+    const originalDirectory = join(root, "original-journal");
+    await rename(journalDirectory, originalDirectory);
+    await symlink(externalDirectory, journalDirectory);
     releaseVerification.resolve();
 
-    await expect(reading).rejects.toMatchObject({ code: "unsafe_symbolic_link" });
-    const externalAfter = await lstat(externalDirectory);
+    await expect(reading).rejects.toMatchObject({ code: "io_failure" });
+    const externalAfter = await lstat(externalTarget);
     expect(externalAfter.ino).toBe(externalBefore.ino);
-    expect(externalAfter.mode & 0o777).toBe(0o700);
-    await expect(readFile(marker, "utf8")).resolves.toBe("external directory");
-    await expect(readFile(target)).resolves.toEqual(source);
-    expect(await readdir(originalDirectory)).toHaveLength(1);
-  });
-
-  test("rejects an unknown quarantine node without changing it", async () => {
-    const directory = await temporaryDirectory("yaca-jsonl-evidence-node-");
-    const target = join(directory, "events.jsonl");
-    const tail = Buffer.from('{"sequence":');
-    const source = Buffer.concat([Buffer.from('{"sequence":1}\n'), tail]);
-    await writeFile(target, source, { mode: 0o600 });
-    await new DurableJsonl<{ sequence: number }>(target).readValidPrefix();
-    const quarantineDirectory = join(directory, "events.jsonl.quarantine");
-    const [quarantineName] = await readdir(quarantineDirectory);
-    const quarantinePath = join(quarantineDirectory, quarantineName!);
-    const originalEvidencePath = join(quarantineDirectory, "original-evidence");
-    await rename(quarantinePath, originalEvidencePath);
-    await mkdir(quarantinePath, { mode: 0o700 });
-    const reopened = new DurableJsonl<{ sequence: number }>(target);
-
-    await expect(reopened.readValidPrefix()).rejects.toMatchObject({ code: "io_failure" });
-
-    const unknownNode = await lstat(quarantinePath);
-    expect(unknownNode.isDirectory()).toBe(true);
-    expect(unknownNode.mode & 0o777).toBe(0o700);
-    await expect(readFile(originalEvidencePath)).resolves.toEqual(tail);
-    await expect(readFile(target)).resolves.toEqual(source);
-  });
-
-  test("rejects hard-linked evidence without changing the external file", async () => {
-    const directory = await temporaryDirectory("yaca-jsonl-evidence-hardlink-");
-    const target = join(directory, "events.jsonl");
-    const tail = Buffer.from('{"sequence":');
-    const source = Buffer.concat([Buffer.from('{"sequence":1}\n'), tail]);
-    await writeFile(target, source, { mode: 0o600 });
-    await new DurableJsonl<{ sequence: number }>(target).readValidPrefix();
-    const quarantineDirectory = join(directory, "events.jsonl.quarantine");
-    const [quarantineName] = await readdir(quarantineDirectory);
-    const quarantinePath = join(quarantineDirectory, quarantineName!);
-    await rename(quarantinePath, join(quarantineDirectory, "original-evidence"));
-    const externalFile = join(directory, "external-evidence");
-    await writeFile(externalFile, tail, { mode: 0o644 });
-    await chmod(externalFile, 0o644);
-    await link(externalFile, quarantinePath);
-    const before = await lstat(externalFile);
-    const reopened = new DurableJsonl<{ sequence: number }>(target);
-
-    await expect(reopened.readValidPrefix()).rejects.toMatchObject({ code: "io_failure" });
-
-    const after = await lstat(externalFile);
-    const linked = await lstat(quarantinePath);
-    expect(after.ino).toBe(before.ino);
-    expect(after.nlink).toBe(2);
-    expect(linked.ino).toBe(before.ino);
-    expect(linked.nlink).toBe(2);
-    expect(after.mode & 0o777).toBe(0o644);
-    expect(linked.mode & 0o777).toBe(0o644);
-    await expect(readFile(externalFile)).resolves.toEqual(tail);
-    await expect(readFile(target)).resolves.toEqual(source);
-  });
-
-  test("bounds concurrent instance quarantine creation to one evidence file", async () => {
-    const directory = await temporaryDirectory("yaca-jsonl-evidence-concurrent-");
-    const target = join(directory, "events.jsonl");
-    const tail = Buffer.from('{"sequence":');
-    const source = Buffer.concat([Buffer.from('{"sequence":1}\n'), tail]);
-    await writeFile(target, source, { mode: 0o600 });
-    const writeEntered = deferred();
-    const releaseWrite = deferred();
-    let blockCreation = true;
-    const creator = new DurableJsonl<{ sequence: number }>(target, {
-      faultInjector: async (operation) => {
-        if (operation === "quarantine-write" && blockCreation) {
-          blockCreation = false;
-          writeEntered.resolve();
-          await releaseWrite.promise;
-        }
-      },
-    });
-
-    const creating = creator.readValidPrefix();
-    await writeEntered.promise;
-    const contenders = Array.from({ length: 7 }, () =>
-      new DurableJsonl<{ sequence: number }>(target).readValidPrefix(),
-    );
-    const contenderOutcomes = await Promise.allSettled(contenders);
-    expect(
-      contenderOutcomes.every(
-        (outcome) =>
-          outcome.status === "rejected" &&
-          (outcome.reason as PersistenceError).code === "io_failure",
-      ),
-    ).toBe(true);
-    releaseWrite.resolve();
-    const outcomes = await Promise.allSettled([creating]);
-
-    const fulfilled = outcomes.filter(
-      (outcome): outcome is PromiseFulfilledResult<Awaited<typeof creating>> =>
-        outcome.status === "fulfilled",
-    );
-    expect(fulfilled.length).toBeGreaterThanOrEqual(1);
-    expect(
-      outcomes
-        .filter((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected")
-        .every((outcome) => (outcome.reason as PersistenceError).code === "io_failure"),
-    ).toBe(true);
-    expect(await readdir(join(directory, "events.jsonl.quarantine"))).toHaveLength(1);
-    expect(new Set(fulfilled.map((outcome) => outcome.value.quarantinedTail!.id)).size).toBe(1);
-    await expect(fulfilled[0]!.value.quarantinedTail!.read()).resolves.toEqual(tail);
-    await expect(readFile(target)).resolves.toEqual(source);
+    expect(externalAfter.mode).toBe(externalBefore.mode);
+    expect(externalAfter.size).toBe(externalBefore.size);
+    await expect(readFile(externalTarget)).resolves.toEqual(original);
+    await expect(readFile(join(originalDirectory, "events.jsonl"))).resolves.toEqual(original);
   });
 
   test("reopens an existing partial tail as degraded before any append", async () => {
@@ -674,12 +471,7 @@ describe("DurableJsonl", () => {
 
     expect(reopened.status).toBe("degraded");
     await expect(readFile(target)).resolves.toEqual(original);
-    const quarantineDirectory = join(directory, "events.jsonl.quarantine");
-    const quarantineEntries = await readdir(quarantineDirectory);
-    expect(quarantineEntries).toHaveLength(1);
-    const quarantinePath = join(quarantineDirectory, quarantineEntries[0]!);
-    await expect(readFile(quarantinePath)).resolves.toEqual(tail);
-    expect((await lstat(quarantinePath)).mode & 0o777).toBe(0o600);
+    expect(await readdir(directory)).toEqual(["events.jsonl"]);
   });
 
   test("rejects a symbolic-link ledger without changing its target", async () => {

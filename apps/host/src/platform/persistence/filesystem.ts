@@ -9,9 +9,7 @@ export type PersistenceOperation =
   | "file-fsync"
   | "rename"
   | "directory-fsync"
-  | "quarantine-write"
-  | "quarantine-directory-verified"
-  | "quarantine-verified";
+  | "corrupt-tail-verified";
 
 export type PersistenceFaultInjector = (operation: PersistenceOperation) => void | Promise<void>;
 
@@ -33,10 +31,19 @@ export async function injectFault(
 }
 
 export async function resolveTarget(requestedPath: string): Promise<ResolvedTarget> {
+  const target = await resolveReadOnlyTarget(requestedPath);
+  try {
+    await chmod(target.directory, 0o700);
+    return target;
+  } catch (error) {
+    throw persistenceError(error);
+  }
+}
+
+export async function resolveReadOnlyTarget(requestedPath: string): Promise<ResolvedTarget> {
   try {
     const absolutePath = resolve(requestedPath);
     const directory = await realpath(dirname(absolutePath));
-    await chmod(directory, 0o700);
     const path = join(directory, basename(absolutePath));
     await rejectSymbolicLink(path);
     return { directory, path };

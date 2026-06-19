@@ -1,4 +1,5 @@
 export type PersistenceErrorCode =
+  | "content_too_large"
   | "cross_device_rename"
   | "degraded"
   | "invalid_json"
@@ -6,6 +7,7 @@ export type PersistenceErrorCode =
   | "unsafe_symbolic_link";
 
 const ERROR_MESSAGES: Record<PersistenceErrorCode, string> = {
+  content_too_large: "persistent content exceeds the safe read limit",
   cross_device_rename: "atomic replacement crossed a filesystem boundary",
   degraded: "durable journal is degraded and read-only",
   invalid_json: "persistent data is not valid JSON",
