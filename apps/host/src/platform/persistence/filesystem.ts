@@ -1,54 +1,120 @@
-import { constants } from "node:fs";
-import { chmod, lstat, open, realpath } from "node:fs/promises";
+import { constants, type BigIntStats } from "node:fs";
+import { lstat, open, realpath, type FileHandle } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { PersistenceError, persistenceError } from "./errors.js";
 
 export type PersistenceOperation =
   | "read"
+  | "read-sized"
+  | "append-open"
   | "write"
   | "file-fsync"
+  | "temporary-create"
   | "rename"
   | "directory-fsync"
   | "corrupt-tail-verified";
 
-export type PersistenceFaultInjector = (operation: PersistenceOperation) => void | Promise<void>;
+export interface PersistenceFaultContext {
+  readonly byteLength?: number;
+}
+
+export type PersistenceFaultInjector = (
+  operation: PersistenceOperation,
+  context?: PersistenceFaultContext,
+) => void | Promise<void>;
 
 export interface PersistenceOptions<T> {
   faultInjector?: PersistenceFaultInjector;
   parse?: (value: unknown) => T;
 }
 
+export interface DirectoryIdentity {
+  readonly canonicalPath: string;
+  readonly device: bigint;
+  readonly inode: bigint;
+  readonly user: bigint;
+  readonly mode: bigint;
+}
+
 export interface ResolvedTarget {
-  directory: string;
-  path: string;
+  readonly directory: string;
+  readonly path: string;
+  readonly parent: DirectoryIdentity;
 }
 
 export async function injectFault(
   injector: PersistenceFaultInjector | undefined,
   operation: PersistenceOperation,
+  context?: PersistenceFaultContext,
 ): Promise<void> {
-  await injector?.(operation);
-}
-
-export async function resolveTarget(requestedPath: string): Promise<ResolvedTarget> {
-  const target = await resolveReadOnlyTarget(requestedPath);
-  try {
-    await chmod(target.directory, 0o700);
-    return target;
-  } catch (error) {
-    throw persistenceError(error);
-  }
+  await injector?.(operation, context);
 }
 
 export async function resolveReadOnlyTarget(requestedPath: string): Promise<ResolvedTarget> {
   try {
     const absolutePath = resolve(requestedPath);
-    const directory = await realpath(dirname(absolutePath));
+    const requestedDirectory = dirname(absolutePath);
+    const directory = await realpath(requestedDirectory);
+    if (directory !== requestedDirectory) throw new PersistenceError("unsafe_symbolic_link");
     const path = join(directory, basename(absolutePath));
     await rejectSymbolicLink(path);
-    return { directory, path };
+    const parent = await inspectDirectory(directory);
+    return { directory, path, parent };
   } catch (error) {
     throw persistenceError(error);
+  }
+}
+
+export async function openVerifiedDirectory(target: ResolvedTarget): Promise<FileHandle> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(
+      target.directory,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    const descriptor = await handle.stat({ bigint: true });
+    assertDirectoryIdentity(target.parent, descriptor);
+    await verifyDirectoryIdentity(target);
+    return handle;
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    throw persistenceError(error);
+  }
+}
+
+export async function verifyDirectoryIdentity(target: ResolvedTarget): Promise<void> {
+  const canonical = await realpath(target.directory);
+  if (canonical !== target.parent.canonicalPath) throw new PersistenceError("io_failure");
+  const pathStat = await lstat(target.directory, { bigint: true });
+  assertDirectoryIdentity(target.parent, pathStat);
+}
+
+export async function verifyFilePath(
+  target: ResolvedTarget,
+  descriptor: BigIntStats,
+): Promise<BigIntStats> {
+  await verifyDirectoryIdentity(target);
+  const canonical = await realpath(target.path);
+  if (canonical !== target.path) throw new PersistenceError("unsafe_symbolic_link");
+  const pathStat = await lstat(target.path, { bigint: true });
+  assertSafeFile(pathStat, target.parent.device);
+  if (pathStat.dev !== descriptor.dev || pathStat.ino !== descriptor.ino) {
+    throw new PersistenceError("io_failure");
+  }
+  return pathStat;
+}
+
+export function assertSafeFile(stat: BigIntStats, expectedDevice: bigint): void {
+  const owner = process.getuid?.();
+  if (
+    !stat.isFile() ||
+    stat.isSymbolicLink() ||
+    stat.dev !== expectedDevice ||
+    stat.nlink !== 1n ||
+    (stat.mode & 0o777n) !== 0o600n ||
+    (owner !== undefined && stat.uid !== BigInt(owner))
+  ) {
+    throw new PersistenceError("io_failure");
   }
 }
 
@@ -63,17 +129,12 @@ export async function rejectSymbolicLink(path: string): Promise<void> {
   }
 }
 
-export async function syncDirectory(
-  directory: string,
+export async function syncDirectoryHandle(
+  handle: FileHandle,
   injector?: PersistenceFaultInjector,
 ): Promise<void> {
   await injectFault(injector, "directory-fsync");
-  const handle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
-  try {
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
+  await handle.sync();
 }
 
 export function serializeJson(value: unknown): Buffer {
@@ -93,5 +154,66 @@ export function parseJson<T>(bytes: Uint8Array, parse?: (value: unknown) => T): 
     return parse ? parse(value) : (value as T);
   } catch {
     throw new PersistenceError("invalid_json");
+  }
+}
+
+async function inspectDirectory(directory: string): Promise<DirectoryIdentity> {
+  let handle: FileHandle | undefined;
+  try {
+    const pathBefore = await lstat(directory, { bigint: true });
+    assertSafeDirectory(pathBefore);
+    handle = await open(
+      directory,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    const descriptor = await handle.stat({ bigint: true });
+    assertSameDirectory(pathBefore, descriptor);
+    const pathAfter = await lstat(directory, { bigint: true });
+    assertSameDirectory(descriptor, pathAfter);
+    return {
+      canonicalPath: directory,
+      device: descriptor.dev,
+      inode: descriptor.ino,
+      user: descriptor.uid,
+      mode: descriptor.mode & 0o777n,
+    };
+  } finally {
+    await handle?.close();
+  }
+}
+
+function assertSafeDirectory(stat: BigIntStats): void {
+  const owner = process.getuid?.();
+  if (
+    !stat.isDirectory() ||
+    stat.isSymbolicLink() ||
+    (stat.mode & 0o777n) !== 0o700n ||
+    (owner !== undefined && stat.uid !== BigInt(owner))
+  ) {
+    throw new PersistenceError("io_failure");
+  }
+}
+
+function assertSameDirectory(expected: BigIntStats, actual: BigIntStats): void {
+  assertSafeDirectory(actual);
+  if (
+    expected.dev !== actual.dev ||
+    expected.ino !== actual.ino ||
+    expected.uid !== actual.uid ||
+    (expected.mode & 0o777n) !== (actual.mode & 0o777n)
+  ) {
+    throw new PersistenceError("io_failure");
+  }
+}
+
+function assertDirectoryIdentity(expected: DirectoryIdentity, actual: BigIntStats): void {
+  assertSafeDirectory(actual);
+  if (
+    expected.device !== actual.dev ||
+    expected.inode !== actual.ino ||
+    expected.user !== actual.uid ||
+    expected.mode !== (actual.mode & 0o777n)
+  ) {
+    throw new PersistenceError("io_failure");
   }
 }

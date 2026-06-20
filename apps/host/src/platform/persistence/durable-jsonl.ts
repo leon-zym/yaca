@@ -1,15 +1,18 @@
 import { createHash } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { open } from "node:fs/promises";
 import { PersistenceError, persistenceError } from "./errors.js";
 import {
+  assertSafeFile,
   injectFault,
+  openVerifiedDirectory,
   parseJson,
   type PersistenceOptions,
   resolveReadOnlyTarget,
-  resolveTarget,
   serializeJson,
-  syncDirectory,
+  syncDirectoryHandle,
+  verifyDirectoryIdentity,
+  verifyFilePath,
 } from "./filesystem.js";
 
 const MAX_LEDGER_READ_BYTES = 268_435_456;
@@ -74,37 +77,57 @@ export class DurableJsonl<T> {
     if (this.#degradedResult) return this.#degradedResult;
     const target = await resolveReadOnlyTarget(this.#requestedPath);
     let handle;
+    let directoryHandle;
     let bytes: Buffer;
     let identity: LedgerIdentity;
     try {
-      const pathBefore = await lstat(target.path, { bigint: true });
-      this.#assertSafeLedger(pathBefore);
+      directoryHandle = await openVerifiedDirectory(target);
       handle = await open(
         target.path,
         constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
       );
       const before = await handle.stat({ bigint: true });
-      this.#assertSafeLedger(before);
-      this.#assertSameLedger(pathBefore, before);
+      assertSafeFile(before, target.parent.device);
+      await verifyFilePath(target, before);
       if (before.size > BigInt(MAX_LEDGER_READ_BYTES)) {
         throw new PersistenceError("content_too_large");
       }
+      bytes = Buffer.alloc(Number(before.size));
+      await injectFault(this.#options.faultInjector, "read-sized", {
+        byteLength: bytes.byteLength,
+      });
       await injectFault(this.#options.faultInjector, "read");
-      bytes = await handle.readFile();
+      let readOffset = 0;
+      while (readOffset < bytes.byteLength) {
+        const { bytesRead } = await handle.read(
+          bytes,
+          readOffset,
+          bytes.byteLength - readOffset,
+          readOffset,
+        );
+        if (bytesRead === 0) throw new PersistenceError("io_failure");
+        readOffset += bytesRead;
+      }
       const after = await handle.stat({ bigint: true });
-      this.#assertSameLedger(before, after);
+      this.#assertSameLedger(before, after, target.parent.device);
       if (after.size !== BigInt(bytes.byteLength)) throw new PersistenceError("io_failure");
-      const pathAfter = await lstat(target.path, { bigint: true });
-      this.#assertSameLedger(after, pathAfter);
+      const pathAfter = await verifyFilePath(target, after);
+      this.#assertSameLedger(after, pathAfter, target.parent.device);
       identity = this.#identity(after);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && handle === undefined) {
+        try {
+          await verifyDirectoryIdentity(target);
+        } catch (verificationError) {
+          throw persistenceError(verificationError);
+        }
         this.#inspected = true;
         return { records: [], corruptTail: null };
       }
       throw persistenceError(error);
     } finally {
       await handle?.close();
+      await directoryHandle?.close();
     }
 
     const records: T[] = [];
@@ -136,7 +159,7 @@ export class DurableJsonl<T> {
     const corruptTail = Object.freeze({
       id,
       byteLength: tail.byteLength,
-      read: () => this.#readCorruptTail(target.path, identity, offset, tail.byteLength, tailDigest),
+      read: () => this.#readCorruptTail(target, identity, offset, tail.byteLength, tailDigest),
     });
     this.#degradedResult = { records, corruptTail };
     return this.#degradedResult;
@@ -154,23 +177,45 @@ export class DurableJsonl<T> {
   async #append(value: T): Promise<void> {
     if (!this.#inspected) await this.#readValidPrefix();
     if (this.#status === "degraded") throw new PersistenceError("degraded");
-    const target = await resolveTarget(this.#requestedPath);
+    const target = await resolveReadOnlyTarget(this.#requestedPath);
     const bytes = Buffer.concat([serializeJson(value), Buffer.from("\n")]);
     let handle;
+    let directoryHandle;
     try {
-      handle = await open(
-        target.path,
-        constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW,
-        0o600,
-      );
-      await handle.chmod(0o600);
+      directoryHandle = await openVerifiedDirectory(target);
+      await injectFault(this.#options.faultInjector, "append-open");
+      await verifyDirectoryIdentity(target);
+      try {
+        handle = await open(
+          target.path,
+          constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        );
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        handle = await open(
+          target.path,
+          constants.O_APPEND |
+            constants.O_CREAT |
+            constants.O_EXCL |
+            constants.O_WRONLY |
+            constants.O_NOFOLLOW |
+            constants.O_NONBLOCK,
+          0o600,
+        );
+      }
+      const descriptor = await handle.stat({ bigint: true });
+      assertSafeFile(descriptor, target.parent.device);
+      await verifyFilePath(target, descriptor);
       await injectFault(this.#options.faultInjector, "write");
       await handle.writeFile(bytes);
       await injectFault(this.#options.faultInjector, "file-fsync");
       await handle.sync();
-      await handle.close();
-      handle = undefined;
-      await syncDirectory(target.directory, this.#options.faultInjector);
+      const durable = await handle.stat({ bigint: true });
+      assertSafeFile(durable, target.parent.device);
+      if (durable.dev !== descriptor.dev || durable.ino !== descriptor.ino) {
+        throw new PersistenceError("io_failure");
+      }
+      await syncDirectoryHandle(directoryHandle, this.#options.faultInjector);
     } catch (error) {
       this.#status = "degraded";
       try {
@@ -179,11 +224,14 @@ export class DurableJsonl<T> {
         // Preserve the operation failure.
       }
       throw persistenceError(error);
+    } finally {
+      await handle?.close().catch(() => undefined);
+      await directoryHandle?.close().catch(() => undefined);
     }
   }
 
   async #readCorruptTail(
-    path: string,
+    target: Awaited<ReturnType<typeof resolveReadOnlyTarget>>,
     expected: LedgerIdentity,
     offset: number,
     byteLength: number,
@@ -193,12 +241,17 @@ export class DurableJsonl<T> {
       throw new PersistenceError("content_too_large");
     }
     let handle;
+    let directoryHandle;
     try {
-      const pathBefore = await lstat(path, { bigint: true });
-      this.#assertIdentity(expected, pathBefore);
-      handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      directoryHandle = await openVerifiedDirectory(target);
+      handle = await open(
+        target.path,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
       const before = await handle.stat({ bigint: true });
-      this.#assertIdentity(expected, before);
+      this.#assertIdentity(expected, before, target.parent.device);
+      const pathBefore = await verifyFilePath(target, before);
+      this.#assertIdentity(expected, pathBefore, target.parent.device);
       const bytes = Buffer.alloc(byteLength);
       let readOffset = 0;
       while (readOffset < byteLength) {
@@ -212,36 +265,25 @@ export class DurableJsonl<T> {
         readOffset += bytesRead;
       }
       const after = await handle.stat({ bigint: true });
-      this.#assertIdentity(expected, after);
+      this.#assertIdentity(expected, after, target.parent.device);
       if (createHash("sha256").update(bytes).digest("hex") !== expectedDigest) {
         throw new PersistenceError("io_failure");
       }
       await injectFault(this.#options.faultInjector, "corrupt-tail-verified");
-      const pathAfter = await lstat(path, { bigint: true });
-      this.#assertIdentity(expected, pathAfter);
+      await verifyDirectoryIdentity(target);
+      const pathAfter = await verifyFilePath(target, after);
+      this.#assertIdentity(expected, pathAfter, target.parent.device);
       return bytes;
     } catch (error) {
       throw persistenceError(error);
     } finally {
       await handle?.close();
+      await directoryHandle?.close();
     }
   }
 
-  #assertSafeLedger(stat: BigIntStats): void {
-    if (stat.isSymbolicLink()) throw new PersistenceError("unsafe_symbolic_link");
-    const owner = process.getuid?.();
-    if (
-      !stat.isFile() ||
-      stat.nlink !== 1n ||
-      (stat.mode & 0o777n) !== 0o600n ||
-      (owner !== undefined && stat.uid !== BigInt(owner))
-    ) {
-      throw new PersistenceError("io_failure");
-    }
-  }
-
-  #assertSameLedger(expected: BigIntStats, actual: BigIntStats): void {
-    this.#assertSafeLedger(actual);
+  #assertSameLedger(expected: BigIntStats, actual: BigIntStats, device: bigint): void {
+    assertSafeFile(actual, device);
     if (
       expected.dev !== actual.dev ||
       expected.ino !== actual.ino ||
@@ -266,8 +308,8 @@ export class DurableJsonl<T> {
     };
   }
 
-  #assertIdentity(expected: LedgerIdentity, actual: BigIntStats): void {
-    this.#assertSafeLedger(actual);
+  #assertIdentity(expected: LedgerIdentity, actual: BigIntStats, device: bigint): void {
+    assertSafeFile(actual, device);
     if (
       expected.device !== actual.dev ||
       expected.inode !== actual.ino ||

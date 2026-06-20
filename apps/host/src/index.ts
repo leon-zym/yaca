@@ -8,6 +8,7 @@ export {
   type DurableJsonlStatus,
   type JsonlReadResult,
   type PersistenceErrorCode,
+  type PersistenceFaultContext,
   type PersistenceFaultInjector,
   type PersistenceOperation,
   type PersistenceOptions,

@@ -7,6 +7,7 @@ export {
 } from "./durable-jsonl.js";
 export { PersistenceError, type PersistenceErrorCode } from "./errors.js";
 export {
+  type PersistenceFaultContext,
   type PersistenceFaultInjector,
   type PersistenceOperation,
   type PersistenceOptions,
