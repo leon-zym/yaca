@@ -49,11 +49,19 @@ Useful options:
 - `--port <port>` selects the local port; use `0` to ask the OS for an ephemeral port.
 - `--host <host>` exists for explicit configuration but accepts only `127.0.0.1`.
 
-The production CLI always uses `~/.yaca/`. If the root is missing, yaca creates it with owner-only
-permissions (`0700`) and canonicalizes it before the Host starts. It refuses a symbolic link at the
-data-root leaf and rejects derived paths that escape the canonical root. A stable hash of that root
-selects two distinct yaca authority ports from independent SHA-256 segments across the dynamic and
-private loopback range `49152–65535`. The Host binds both ports exclusively before starting HTTP;
+The production CLI always uses `~/.yaca/`. On a fresh install, the first `yaca` start creates the
+root and its seven runtime directories—`agent`, `app`, `content`, `trash`, `logs`, `run`, and
+`tmp`—with exact owner-only permissions (`0700`); no manual directory preparation is required.
+An existing root or runtime directory is accepted only when it is a canonical, non-symlink
+directory owned by the current user with mode `0700`. yaca never repairs an existing directory's
+permissions automatically. If startup reports an unsafe existing directory, inspect its ownership
+and, when it is the intended current-user directory, run `chmod 700 ~/.yaca` for the root or, for
+example, `chmod 700 ~/.yaca/app` when `app` is the directory named by the error, then start yaca
+again. Derived paths that escape the canonical root are rejected.
+
+A stable hash of the canonical root selects two distinct yaca authority ports from independent
+SHA-256 segments across the dynamic and private loopback range `49152–65535`. The Host binds both
+ports exclusively before starting HTTP;
 the pair of kernel sockets is the ownership fence and is released immediately if the process exits
 or is killed. If either bind fails, startup releases any socket already acquired and fails closed.
 No ownership or diagnostic lock file is written to disk; the non-sensitive derived port pair is
@@ -102,12 +110,14 @@ pnpm build
 pnpm check
 ```
 
-Tests use temporary filesystems and real loopback HTTP. They cover canonical runtime-root
-preparation, root-leaf and derived-path symlink rejection, owner-only root creation, the kernel
-authority fence (including SIGKILL recovery, event-loop blocking, unrelated port ownership, and
-concurrent contenders), bounded connection shutdown, non-loopback rejection, the health schema,
-production and POSIX development CLI startup, and Web static fallback. The pack smoke builds a
-tarball, installs it into a fresh temporary consumer, and starts the installed `yaca` binary.
+Tests use temporary filesystems and real loopback HTTP. They cover creation and canonicalization of
+the root and all seven runtime directories, acceptance of existing current-user `0700`
+directories, rejection without repair of unsafe existing root/child modes and a hard-linked root
+file, root-leaf and derived-path symlinks, and the kernel authority fence (including SIGKILL
+recovery, event-loop blocking, unrelated port ownership, and concurrent contenders). They also
+cover bounded connection shutdown, non-loopback rejection, the health schema, production and POSIX
+development CLI startup, and Web static fallback. The pack smoke builds a tarball, installs it into
+a fresh temporary consumer, and starts the installed `yaca` binary.
 
 ## Security boundary
 
