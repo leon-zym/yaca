@@ -3,7 +3,9 @@ import { constants, type BigIntStats } from "node:fs";
 import { open } from "node:fs/promises";
 import { PersistenceError, persistenceError } from "./errors.js";
 import {
+  assertFileIdentity,
   assertSafeFile,
+  captureLeafState,
   injectFault,
   openVerifiedDirectory,
   parseJson,
@@ -13,6 +15,7 @@ import {
   syncDirectoryHandle,
   verifyDirectoryIdentity,
   verifyFilePath,
+  verifyLeafState,
 } from "./filesystem.js";
 
 const MAX_LEDGER_READ_BYTES = 268_435_456;
@@ -178,20 +181,15 @@ export class DurableJsonl<T> {
     if (!this.#inspected) await this.#readValidPrefix();
     if (this.#status === "degraded") throw new PersistenceError("degraded");
     const target = await resolveReadOnlyTarget(this.#requestedPath);
+    const initialLeaf = await captureLeafState(target);
     const bytes = Buffer.concat([serializeJson(value), Buffer.from("\n")]);
     let handle;
     let directoryHandle;
     try {
       directoryHandle = await openVerifiedDirectory(target);
       await injectFault(this.#options.faultInjector, "append-open");
-      await verifyDirectoryIdentity(target);
-      try {
-        handle = await open(
-          target.path,
-          constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-        );
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await verifyLeafState(target, initialLeaf);
+      if (initialLeaf.kind === "missing") {
         handle = await open(
           target.path,
           constants.O_APPEND |
@@ -202,9 +200,17 @@ export class DurableJsonl<T> {
             constants.O_NONBLOCK,
           0o600,
         );
+      } else {
+        handle = await open(
+          target.path,
+          constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        );
       }
       const descriptor = await handle.stat({ bigint: true });
       assertSafeFile(descriptor, target.parent.device);
+      if (initialLeaf.kind === "existing") {
+        assertFileIdentity(initialLeaf.identity, descriptor);
+      }
       await verifyFilePath(target, descriptor);
       await injectFault(this.#options.faultInjector, "write");
       await handle.writeFile(bytes);

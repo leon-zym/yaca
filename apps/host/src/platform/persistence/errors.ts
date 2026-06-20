@@ -15,13 +15,20 @@ const ERROR_MESSAGES: Record<PersistenceErrorCode, string> = {
   unsafe_symbolic_link: "persistent data must not be a symbolic link",
 };
 
+export interface PersistenceDiagnostic {
+  readonly kind: "retained_temporary";
+  readonly id: string;
+}
+
 export class PersistenceError extends Error {
   readonly code: PersistenceErrorCode;
+  readonly diagnostic: PersistenceDiagnostic | undefined;
 
-  constructor(code: PersistenceErrorCode) {
+  constructor(code: PersistenceErrorCode, diagnostic?: PersistenceDiagnostic) {
     super(ERROR_MESSAGES[code]);
     this.name = "PersistenceError";
     this.code = code;
+    this.diagnostic = diagnostic;
   }
 }
 

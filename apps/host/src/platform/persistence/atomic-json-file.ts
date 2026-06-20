@@ -5,6 +5,7 @@ import { basename, join } from "node:path";
 import { PersistenceError, persistenceError } from "./errors.js";
 import {
   assertSafeFile,
+  captureLeafState,
   injectFault,
   openVerifiedDirectory,
   parseJson,
@@ -14,6 +15,7 @@ import {
   syncDirectoryHandle,
   verifyDirectoryIdentity,
   verifyFilePath,
+  verifyLeafState,
 } from "./filesystem.js";
 
 export class AtomicJsonFile<T> {
@@ -67,8 +69,10 @@ export class AtomicJsonFile<T> {
 
   async replace(value: T): Promise<void> {
     const target = await resolveReadOnlyTarget(this.#requestedPath);
+    const initialLeaf = await captureLeafState(target);
     const bytes = Buffer.concat([serializeJson(value), Buffer.from("\n")]);
     const temporaryPath = join(target.directory, `.${basename(target.path)}.tmp-${randomUUID()}`);
+    const retainedTemporaryId = randomUUID();
     const temporaryTarget = { ...target, path: temporaryPath };
     let handle;
     let directoryHandle;
@@ -82,6 +86,7 @@ export class AtomicJsonFile<T> {
       // Bracketing checks fail visible swaps; an active same-UID swap between
       // this final check and open/rename remains outside the local threat model.
       await verifyDirectoryIdentity(target);
+      await verifyLeafState(target, initialLeaf);
       handle = await open(
         temporaryPath,
         constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
@@ -90,10 +95,12 @@ export class AtomicJsonFile<T> {
       temporaryIdentity = await handle.stat({ bigint: true });
       assertSafeFile(temporaryIdentity, target.parent.device);
       await verifyFilePath(temporaryTarget, temporaryIdentity);
-      await this.#validateExistingTarget(target);
+      await verifyLeafState(target, initialLeaf);
       await injectFault(this.#options.faultInjector, "write");
+      await verifyLeafState(target, initialLeaf);
       await handle.writeFile(bytes);
       await injectFault(this.#options.faultInjector, "file-fsync");
+      await verifyLeafState(target, initialLeaf);
       await handle.sync();
       const durableTemporary = await handle.stat({ bigint: true });
       assertSafeFile(durableTemporary, target.parent.device);
@@ -105,60 +112,61 @@ export class AtomicJsonFile<T> {
       }
       temporaryIdentity = durableTemporary;
       await verifyFilePath(temporaryTarget, temporaryIdentity);
+      await verifyLeafState(target, initialLeaf);
       await injectFault(this.#options.faultInjector, "rename");
       await verifyDirectoryIdentity(target);
       await verifyFilePath(temporaryTarget, temporaryIdentity);
+      await verifyLeafState(target, initialLeaf);
       await rename(temporaryPath, target.path);
       renamed = true;
       await verifyDirectoryIdentity(target);
       await verifyFilePath(target, temporaryIdentity);
       await syncDirectoryHandle(directoryHandle, this.#options.faultInjector);
     } catch (error) {
+      const failure = persistenceError(error);
       try {
         await handle?.close();
       } catch {
         // Preserve the operation failure; cleanup is best effort.
       }
+      let retainedTemporary = false;
       if (!renamed && temporaryIdentity) {
-        await this.#removeTemporaryIfStillOwned(temporaryTarget, temporaryIdentity);
+        retainedTemporary = !(await this.#removeTemporaryIfStillOwned(
+          temporaryTarget,
+          temporaryIdentity,
+        ));
       }
-      throw persistenceError(error);
+      if (retainedTemporary) {
+        throw new PersistenceError(failure.code, {
+          kind: "retained_temporary",
+          id: retainedTemporaryId,
+        });
+      }
+      throw failure;
     } finally {
       await handle?.close().catch(() => undefined);
       await directoryHandle?.close().catch(() => undefined);
     }
   }
 
-  async #validateExistingTarget(
-    target: Awaited<ReturnType<typeof resolveReadOnlyTarget>>,
-  ): Promise<void> {
-    let handle;
-    try {
-      handle = await open(target.path, constants.O_RDONLY | constants.O_NOFOLLOW);
-      const descriptor = await handle.stat({ bigint: true });
-      assertSafeFile(descriptor, target.parent.device);
-      await verifyFilePath(target, descriptor);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw error;
-    } finally {
-      await handle?.close();
-    }
-  }
-
   async #removeTemporaryIfStillOwned(
     temporaryTarget: Awaited<ReturnType<typeof resolveReadOnlyTarget>>,
     identity: BigIntStats,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       // Node has no openat/unlinkat seam. Cleanup is attempted only after the held
       // parent and temporary descriptor identities still match; active same-UID
       // path replacement between this check and rm is outside the local threat model.
       await verifyDirectoryIdentity(temporaryTarget);
       await verifyFilePath(temporaryTarget, identity);
+      await injectFault(this.#options.faultInjector, "temporary-cleanup");
+      await verifyDirectoryIdentity(temporaryTarget);
+      await verifyFilePath(temporaryTarget, identity);
       await rm(temporaryTarget.path, { force: true });
+      return true;
     } catch {
       // Leaving a private temp is safer than deleting through an untrusted path.
+      return false;
     }
   }
 }

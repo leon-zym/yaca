@@ -1,4 +1,16 @@
-import { chmod, mkdtemp, mkdir, readdir, realpath, stat, symlink } from "node:fs/promises";
+import {
+  chmod,
+  link,
+  lstat,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { prepareYacaPaths } from "@yaca/host";
@@ -52,20 +64,68 @@ describe("yaca persistence paths", () => {
     expect((await stat(paths.root)).mode & 0o777).toBe(0o700);
   });
 
-  test("normalizes the root and every runtime directory to owner-only permissions", async () => {
+  test("rejects an existing root with unsafe permissions without repairing it", async () => {
     const parent = await mkdtemp(join(tmpdir(), "yaca-root-existing-mode-"));
     temporaryRoots.push(parent);
     const requestedRoot = join(parent, "data");
     await mkdir(requestedRoot, { mode: 0o755 });
-    await mkdir(join(requestedRoot, "app"), { mode: 0o755 });
     await chmod(requestedRoot, 0o755);
-    await chmod(join(requestedRoot, "app"), 0o755);
 
-    const paths = await prepareYacaPaths({ root: requestedRoot });
+    await expect(prepareYacaPaths({ root: requestedRoot })).rejects.toThrow();
 
+    expect((await lstat(requestedRoot)).mode & 0o777).toBe(0o755);
+    expect(await readdir(requestedRoot)).toEqual([]);
+  });
+
+  test("accepts an existing owner-only root and children", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "yaca-root-safe-mode-"));
+    temporaryRoots.push(parent);
+    const requestedRoot = join(parent, "data");
+    await mkdir(requestedRoot, { mode: 0o700 });
+    await chmod(requestedRoot, 0o700);
+
+    const first = await prepareYacaPaths({ root: requestedRoot });
+    const second = await prepareYacaPaths({ root: requestedRoot });
+
+    expect(second).toEqual(first);
     await expect(
-      Promise.all(Object.values(paths).map(async (path) => (await stat(path)).mode & 0o777)),
+      Promise.all(Object.values(second).map(async (path) => (await stat(path)).mode & 0o777)),
     ).resolves.toEqual([0o700, 0o700, 0o700, 0o700, 0o700, 0o700, 0o700, 0o700]);
+  });
+
+  test("rejects a hard-linked user file as the data root without changing it", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "yaca-root-hardlink-"));
+    temporaryRoots.push(parent);
+    const source = join(parent, "user-file");
+    const requestedRoot = join(parent, "data");
+    const original = Buffer.from("protected user bytes\n");
+    await writeFile(source, original, { mode: 0o640 });
+    await chmod(source, 0o640);
+    await link(source, requestedRoot);
+    const before = await lstat(source);
+
+    await expect(prepareYacaPaths({ root: requestedRoot })).rejects.toThrow();
+
+    const after = await lstat(source);
+    expect(after.ino).toBe(before.ino);
+    expect(after.mode).toBe(before.mode);
+    await expect(readFile(source)).resolves.toEqual(original);
+    await expect(readFile(requestedRoot)).resolves.toEqual(original);
+  });
+
+  test("rejects an unsafe existing child without repairing it", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "yaca-child-mode-"));
+    temporaryRoots.push(parent);
+    const requestedRoot = join(parent, "data");
+    const app = join(requestedRoot, "app");
+    await mkdir(requestedRoot, { mode: 0o700 });
+    await mkdir(app, { mode: 0o755 });
+    await chmod(requestedRoot, 0o700);
+    await chmod(app, 0o755);
+
+    await expect(prepareYacaPaths({ root: requestedRoot })).rejects.toThrow();
+
+    expect((await lstat(app)).mode & 0o777).toBe(0o755);
   });
 
   test("rejects a yaca data root whose leaf is a symbolic link", async () => {
@@ -99,8 +159,9 @@ describe("yaca persistence paths", () => {
     temporaryRoots.push(parent);
     const root = join(parent, "data");
     const escape = join(parent, "escape");
-    await mkdir(root);
+    await mkdir(root, { mode: 0o700 });
     await mkdir(escape);
+    await chmod(root, 0o700);
     await symlink(escape, join(root, "run"), "dir");
 
     await expect(prepareYacaPaths({ root })).rejects.toThrow("escapes the yaca root");

@@ -10,6 +10,7 @@ export type PersistenceOperation =
   | "write"
   | "file-fsync"
   | "temporary-create"
+  | "temporary-cleanup"
   | "rename"
   | "directory-fsync"
   | "corrupt-tail-verified";
@@ -41,6 +42,18 @@ export interface ResolvedTarget {
   readonly path: string;
   readonly parent: DirectoryIdentity;
 }
+
+export interface FileIdentity {
+  readonly device: bigint;
+  readonly inode: bigint;
+  readonly user: bigint;
+  readonly links: bigint;
+  readonly mode: bigint;
+}
+
+export type LeafState =
+  | { readonly kind: "missing" }
+  | { readonly kind: "existing"; readonly identity: FileIdentity };
 
 export async function injectFault(
   injector: PersistenceFaultInjector | undefined,
@@ -104,6 +117,50 @@ export async function verifyFilePath(
   return pathStat;
 }
 
+export async function captureLeafState(target: ResolvedTarget): Promise<LeafState> {
+  await verifyDirectoryIdentity(target);
+  try {
+    const pathStat = await lstat(target.path, { bigint: true });
+    assertSafeFile(pathStat, target.parent.device);
+    await verifyFilePath(target, pathStat);
+    return { kind: "existing", identity: fileIdentity(pathStat) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    await verifyDirectoryIdentity(target);
+    return { kind: "missing" };
+  }
+}
+
+export async function verifyLeafState(target: ResolvedTarget, expected: LeafState): Promise<void> {
+  await verifyDirectoryIdentity(target);
+  let pathStat: BigIntStats;
+  try {
+    pathStat = await lstat(target.path, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT" && expected.kind === "missing") {
+      await verifyDirectoryIdentity(target);
+      return;
+    }
+    throw error;
+  }
+  if (expected.kind === "missing") throw new PersistenceError("io_failure");
+  assertSafeFile(pathStat, target.parent.device);
+  assertFileIdentity(expected.identity, pathStat);
+  await verifyFilePath(target, pathStat);
+}
+
+export function assertFileIdentity(expected: FileIdentity, actual: BigIntStats): void {
+  if (
+    expected.device !== actual.dev ||
+    expected.inode !== actual.ino ||
+    expected.user !== actual.uid ||
+    expected.links !== actual.nlink ||
+    expected.mode !== (actual.mode & 0o777n)
+  ) {
+    throw new PersistenceError("io_failure");
+  }
+}
+
 export function assertSafeFile(stat: BigIntStats, expectedDevice: bigint): void {
   const owner = process.getuid?.();
   if (
@@ -116,6 +173,16 @@ export function assertSafeFile(stat: BigIntStats, expectedDevice: bigint): void 
   ) {
     throw new PersistenceError("io_failure");
   }
+}
+
+function fileIdentity(stat: BigIntStats): FileIdentity {
+  return {
+    device: stat.dev,
+    inode: stat.ino,
+    user: stat.uid,
+    links: stat.nlink,
+    mode: stat.mode & 0o777n,
+  };
 }
 
 export async function rejectSymbolicLink(path: string): Promise<void> {

@@ -224,6 +224,99 @@ describe("AtomicJsonFile", () => {
     await expect(readFile(target)).resolves.toEqual(original);
     expect((await readdir(directory)).filter((name) => name.includes(".tmp-"))).toEqual([]);
   });
+
+  test("does not replace a user file that appears after an initially missing target", async () => {
+    const directory = await temporaryDirectory("yaca-atomic-missing-leaf-");
+    const target = join(directory, "state.json");
+    const protectedBytes = Buffer.from('{"protected":true}\n');
+    let installed = false;
+    const file = new AtomicJsonFile(target, {
+      faultInjector: async (operation) => {
+        if (operation !== "rename" || installed) return;
+        installed = true;
+        await writeFile(target, protectedBytes, { mode: 0o600 });
+      },
+    });
+
+    await expect(file.replace({ revision: 1 })).rejects.toMatchObject({ code: "io_failure" });
+
+    await expect(readFile(target)).resolves.toEqual(protectedBytes);
+  });
+
+  test("does not replace a new inode substituted for the initial target", async () => {
+    const directory = await temporaryDirectory("yaca-atomic-existing-leaf-");
+    const target = join(directory, "state.json");
+    const originalPath = join(directory, "original-state.json");
+    const originalBytes = Buffer.from('{"revision":1}\n');
+    const replacementBytes = Buffer.from('{"protected":true}\n');
+    await writeFile(target, originalBytes, { mode: 0o600 });
+    const originalBefore = await lstat(target);
+    let replaced = false;
+    const file = new AtomicJsonFile(target, {
+      faultInjector: async (operation) => {
+        if (operation !== "rename" || replaced) return;
+        replaced = true;
+        await rename(target, originalPath);
+        await writeFile(target, replacementBytes, { mode: 0o600 });
+      },
+    });
+
+    await expect(file.replace({ revision: 2 })).rejects.toMatchObject({ code: "io_failure" });
+
+    expect((await lstat(originalPath)).ino).toBe(originalBefore.ino);
+    await expect(readFile(originalPath)).resolves.toEqual(originalBytes);
+    await expect(readFile(target)).resolves.toEqual(replacementBytes);
+  });
+
+  test("does not unlink a replacement installed after temp cleanup validation", async () => {
+    const directory = await temporaryDirectory("yaca-atomic-cleanup-leaf-");
+    const externalDirectory = await temporaryDirectory("yaca-atomic-cleanup-external-");
+    const target = join(directory, "state.json");
+    const externalTarget = join(externalDirectory, "user-file.json");
+    const protectedBytes = Buffer.from('{"protected":true}\n');
+    await writeFile(externalTarget, protectedBytes, { mode: 0o600 });
+    let writeFailed = false;
+    let retainedPath: string | undefined;
+    let replacementPath: string | undefined;
+    let externalAfterInstall: Awaited<ReturnType<typeof lstat>> | undefined;
+    const file = new AtomicJsonFile(target, {
+      faultInjector: async (operation) => {
+        if (operation === "write" && !writeFailed) {
+          writeFailed = true;
+          throw Object.assign(new Error("injected write failure"), { code: "EIO" });
+        }
+        if (operation !== "temporary-cleanup" || retainedPath) return;
+        const temporaryName = (await readdir(directory)).find((name) => name.includes(".tmp-"));
+        expect(temporaryName).toBeDefined();
+        replacementPath = join(directory, temporaryName!);
+        retainedPath = join(directory, `${temporaryName}.retained`);
+        await rename(replacementPath, retainedPath);
+        await link(externalTarget, replacementPath);
+        externalAfterInstall = await lstat(externalTarget);
+      },
+    });
+
+    const failure = await file.replace({ revision: 1 }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      code: "io_failure",
+      diagnostic: { kind: "retained_temporary" },
+    });
+    expect(JSON.stringify((failure as { diagnostic: unknown }).diagnostic)).not.toContain(
+      directory,
+    );
+    await expect(readFile(replacementPath!)).resolves.toEqual(protectedBytes);
+    expect((await lstat(replacementPath!)).mode & 0o777).toBe(0o600);
+    expect((await lstat(retainedPath!)).mode & 0o777).toBe(0o600);
+    const externalAfter = await lstat(externalTarget);
+    expect(externalAfter.ino).toBe(externalAfterInstall!.ino);
+    expect(externalAfter.mode).toBe(externalAfterInstall!.mode);
+    expect(externalAfter.nlink).toBe(externalAfterInstall!.nlink);
+    await expect(readFile(externalTarget)).resolves.toEqual(protectedBytes);
+
+    await expect(new AtomicJsonFile(target).read()).resolves.toBeUndefined();
+    await expect(readFile(retainedPath!)).resolves.toEqual(Buffer.alloc(0));
+  });
 });
 
 describe("DurableJsonl", () => {
@@ -390,6 +483,52 @@ describe("DurableJsonl", () => {
 
     expect(await readdir(externalDirectory)).toEqual([]);
     expect(await readdir(join(root, "original-journal"))).toEqual([]);
+  });
+
+  test("does not append to a user file that appears after a missing-ledger checkpoint", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-missing-leaf-");
+    const target = join(directory, "events.jsonl");
+    const protectedBytes = Buffer.from('{"protected":true}\n');
+    let installed = false;
+    const ledger = new DurableJsonl(target, {
+      faultInjector: async (operation) => {
+        if (operation !== "append-open" || installed) return;
+        installed = true;
+        await writeFile(target, protectedBytes, { mode: 0o600 });
+      },
+    });
+
+    await expect(ledger.append({ sequence: 1 })).rejects.toMatchObject({ code: "io_failure" });
+
+    const after = await lstat(target);
+    expect(after.mode & 0o777).toBe(0o600);
+    await expect(readFile(target)).resolves.toEqual(protectedBytes);
+  });
+
+  test("does not append to a replacement of the initially observed ledger", async () => {
+    const directory = await temporaryDirectory("yaca-jsonl-existing-leaf-");
+    const target = join(directory, "events.jsonl");
+    const originalPath = join(directory, "original-events.jsonl");
+    const originalBytes = Buffer.from('{"sequence":0}\n');
+    const replacementBytes = Buffer.from('{"protected":true}\n');
+    await writeFile(target, originalBytes, { mode: 0o600 });
+    const originalBefore = await lstat(target);
+    let replaced = false;
+    const ledger = new DurableJsonl(target, {
+      faultInjector: async (operation) => {
+        if (operation !== "append-open" || replaced) return;
+        replaced = true;
+        await rename(target, originalPath);
+        await writeFile(target, replacementBytes, { mode: 0o600 });
+      },
+    });
+    await ledger.readValidPrefix();
+
+    await expect(ledger.append({ sequence: 1 })).rejects.toMatchObject({ code: "io_failure" });
+
+    expect((await lstat(originalPath)).ino).toBe(originalBefore.ino);
+    await expect(readFile(originalPath)).resolves.toEqual(originalBytes);
+    await expect(readFile(target)).resolves.toEqual(replacementBytes);
   });
 
   test("does not repair an existing ledger with unsafe permissions", async () => {

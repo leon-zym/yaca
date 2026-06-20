@@ -7,6 +7,7 @@ export {
   type CorruptTailEvidence,
   type DurableJsonlStatus,
   type JsonlReadResult,
+  type PersistenceDiagnostic,
   type PersistenceErrorCode,
   type PersistenceFaultContext,
   type PersistenceFaultInjector,
