@@ -4,7 +4,7 @@
 
 yaca is a desktop-first, local, single-user AI coding agent. Running `yaca` opens a loopback-only Web UI where a user can select a Workspace and Session, submit a Prompt, observe the complete agent loop, stop it, and recover the durable conversation after refresh, disconnection, or Host restart.
 
-The browser never contacts a model Provider or executes tools. The Host is the only authority, and every yaca-owned persistent file lives under `~/.yaca/`.
+The browser never contacts a model Provider or executes tools. The Host is the only authority, and within the documented local single-user persistence threat model every yaca-owned persistent file lives under `~/.yaca/`.
 
 The Foundation and MVP acceptance target is macOS and Linux. Windows build, typecheck, and package smoke are best-effort; Windows hardware and the development process-tree smoke are not release claims for this MVP.
 
@@ -101,7 +101,7 @@ Workspace registration is an operating scope, not a sandbox. The local agent and
 
 SDK repository research confirms that the public 0.84.2 package exposes the required session factory/runtime, event, tool, model, Thinking Level, abort, and JSONL reopen surfaces. Release claims still require the following executable gates against the installed package:
 
-1. Every SDK-owned credential, model, settings, Session, and auxiliary path is directed under `~/.yaca/`; startup fails closed if a yaca-owned write resolves elsewhere.
+1. Every SDK-owned credential, model, settings, Session, and auxiliary path is directed under `~/.yaca/`; within the persistence threat model, startup fails closed if a yaca-owned write resolves elsewhere.
 2. Runtime replacement re-subscribes without duplicate events, and a reopened JSONL produces the expected Committed Snapshot.
 3. Product Turn settlement is mapped from public events without ending early during retry or tool loops.
 4. Abort reaches idle deterministically and produces a truthful terminal projection.

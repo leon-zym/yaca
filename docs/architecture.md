@@ -119,7 +119,7 @@ This follows the public `AgentSessionRuntime` replacement model and avoids worke
 
 ## Authority and persistence
 
-Every yaca-owned persistent file is below `~/.yaca/`:
+Within the persistence threat model below, every yaca-owned persistent file is below `~/.yaca/`:
 
 ```text
 ~/.yaca/
@@ -151,9 +151,11 @@ Authority is divided by fact, not duplicated:
 | Complete oversized output | Content Store | Addressed by digest and scoped metadata |
 | Browser view | Host projection | Always replaceable by sync |
 
-The durable JSONL module is a deep module at the persistence seam: reads and appends share one linear queue, so a read observes only an fsync-complete prefix and cannot race an append. Before allocating a read buffer, it rejects a ledger larger than `268435456` bytes from file metadata. A corrupt tail permanently degrades that module instance and blocks every mutation; the original ledger remains byte-for-byte unchanged.
+The durable JSONL module is a deep module at the persistence seam: reads and appends share one linear queue, so a read observes only an fsync-complete prefix and cannot race an append. A read captures the file size, rejects values above `268435456` bytes, allocates exactly the captured size, and rejects growth before returning. Append opens the ledger first, then verifies through the descriptor that it is a regular, owner-only file with one link on the expected device and that its device/inode still match the canonical path and verified parent. It writes and fsyncs only that descriptor. A corrupt tail permanently degrades that module instance and blocks every mutation; the original ledger remains byte-for-byte unchanged.
 
-Corruption produces logical **Corrupt Tail Evidence**, not a quarantine directory, sidecar, copied tail, or Content Reference. Its interface exposes only an opaque id, byte length, and bounded read operation—never a filesystem path. The evidence binds the canonical ledger's device, inode, owner, link count, mode, size, modification time, change time, valid-prefix offset, tail length, and tail SHA-256. Each evidence read opens the canonical ledger read-only with `O_NOFOLLOW`, reads only the captured range, and verifies descriptor and path identity again. Replacement, symlink or hard-link substitution, metadata or byte modification, and identity mismatch all fail closed. Detecting or reading corruption performs no filesystem write, including no create, copy, rename, truncate, chmod, or metadata repair. [ADR-0005](adr/0005-keep-corrupt-tail-evidence-logical.md) records why yaca rejected a physical quarantine sidecar.
+Corruption produces logical **Corrupt Tail Evidence**, not a quarantine directory, sidecar, copied tail, or Content Reference. Its interface exposes only an opaque id, byte length, and bounded read operation—never a filesystem path. The evidence binds the canonical ledger and parent identities, ledger owner, link count, mode, size, modification time, change time, valid-prefix offset, tail length, and tail SHA-256. Each evidence read opens the canonical ledger read-only with `O_NOFOLLOW`, reads only the captured range, and verifies descriptor, path, and parent identity again. Replacement, symlink or hard-link substitution, metadata or byte modification, and identity mismatch observable at those checks fail closed. Detecting or reading corruption performs no filesystem write, including no create, copy, rename, truncate, chmod, or metadata repair. [ADR-0005](adr/0005-keep-corrupt-tail-evidence-logical.md) records why yaca rejected a physical quarantine sidecar and the remaining path-operation limit.
+
+The atomic JSON module likewise verifies an open parent descriptor and its identity before path creation, after temporary-file creation, and immediately before and after rename. It never repairs permissions on an existing target. Temporary cleanup occurs only while the module can prove the temporary node is the one it created; otherwise it leaves an ambiguous path untouched and fails closed.
 
 The Host does not maintain a durable copy of every realtime event. At settlement it reads the durable Session path again and replaces the Active Overlay with a Committed Snapshot. After restart it does the same without replaying transient deltas.
 
@@ -281,6 +283,12 @@ Chat remains compact; the Inspector provides complete reading. If complete conte
 
 These controls protect the loopback control plane from drive-by browser access. They do not sandbox the agent, shell, local extensions, or Workspace. The process has the user's OS authority.
 
+### Persistence threat model and known limit
+
+The local single-user MVP defends against pre-existing or check-visible symlinks, hard links, path escape, replacement, unsafe ownership or mode, wrong device/inode, and unexpected parent identity. Persistence operations verify open descriptors and paths repeatedly and fail closed on mismatches.
+
+Node does not expose portable descriptor-relative `openat`/`renameat` operations. Consequently, yaca cannot atomically exclude a deliberately timed, same-UID actor that swaps the exact verified parent directory between the final identity check and a path-based create or rename. That active concurrent filesystem attacker is outside the MVP threat model. This limit does not relax crash durability, Host-restart recovery, browser reconnect behavior, or rejection of path anomalies already present or observable at a validation point.
+
 ## Process and CLI
 
 `yaca` is both the product name and primary executable. The CLI:
@@ -323,7 +331,8 @@ The module interface is the test surface.
 - Duplicate identifiers, exhaustive mutation-to-authority mapping, local committed/failed paths, pre-record Prompt identity allocation, Prompt-only Run envelope linkage, delivery/outcome unknown separation, scope-aware acknowledgement, restart priority, truncated tails, and explicit new mutation receive deterministic tests.
 - A fault-injection test kills the Host at each durability boundary and proves it never automatically invokes the same mutation twice.
 - Persistence tests serialize reads with appends across the fsync barrier, reject ledgers above the `268435456`-byte safe-read ceiling before allocation, and prove corrupt-tail detection performs zero filesystem writes while the original ledger remains unchanged.
-- Corrupt Tail Evidence tests cover exact range recovery and fail-closed behavior for replacement, symlink, hard link, permission, owner, device/inode, link-count, size, timestamp, content-digest, and path-versus-descriptor identity changes.
+- Atomic JSON tests cover cross-device rename, pre-existing symlinks and unsafe modes, parent swaps at temporary creation and rename checkpoints, existing-file mode preservation, and refusal to rename an attacker-controlled temporary path. JSONL append tests cover parent swaps, descriptor-only writes after a verified path replacement, missing-target creation checks, unsafe existing mode, and interleaved read/append ordering.
+- Corrupt Tail Evidence tests cover exact range recovery, mode, inode replacement, link count, size growth, timestamp and content mutation, path-versus-descriptor identity, and parent-alias changes. Production guards also reject wrong owner and device; the supported-platform suite does not inject those identities independently. Content mutation is normally detected by change time before the digest check, so the suite does not claim an isolated digest-only branch.
 
 ### Recovery and browser paths
 
