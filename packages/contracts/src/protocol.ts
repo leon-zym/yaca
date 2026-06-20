@@ -1156,6 +1156,7 @@ export function resolveCommandAuthority(
   command: MutationCommandEnvelope,
   context: CommandAuthorityContext = {},
 ): CommandAuthorityResolution {
+  const normalizedContext = (context as CommandAuthorityContext | null) ?? {};
   switch (command.type) {
     case "app.setThemePreference":
     case "command.acknowledgeUnknown":
@@ -1176,7 +1177,7 @@ export function resolveCommandAuthority(
         null,
       );
     case "session.trash.restore": {
-      const workspace = requireAuthorityContext(context, "workspaceId");
+      const workspace = requireAuthorityContext(normalizedContext, "workspaceId");
       return workspace.ok
         ? resolvedAuthority(command.type, workspace.value, workspace.value, null, null, null)
         : workspace.error;
@@ -1186,7 +1187,7 @@ export function resolveCommandAuthority(
     case "session.trash":
     case "runtime.setDesiredModel":
     case "runtime.setDesiredThinking": {
-      const workspace = requireAuthorityContext(context, "workspaceId");
+      const workspace = requireAuthorityContext(normalizedContext, "workspaceId");
       return workspace.ok
         ? resolvedAuthority(
             command.type,
@@ -1199,7 +1200,7 @@ export function resolveCommandAuthority(
         : workspace.error;
     }
     case "run.abort": {
-      const workspace = requireAuthorityContext(context, "workspaceId");
+      const workspace = requireAuthorityContext(normalizedContext, "workspaceId");
       return workspace.ok
         ? resolvedAuthority(
             command.type,
@@ -1212,11 +1213,11 @@ export function resolveCommandAuthority(
         : workspace.error;
     }
     case "run.prompt": {
-      const workspace = requireAuthorityContext(context, "workspaceId");
+      const workspace = requireAuthorityContext(normalizedContext, "workspaceId");
       if (!workspace.ok) return workspace.error;
-      const run = requireAuthorityContext(context, "runId");
+      const run = requireAuthorityContext(normalizedContext, "runId");
       if (!run.ok) return run.error;
-      const productTurn = requireAuthorityContext(context, "productTurnId");
+      const productTurn = requireAuthorityContext(normalizedContext, "productTurnId");
       if (!productTurn.ok) return productTurn.error;
       return resolvedAuthority(
         command.type,

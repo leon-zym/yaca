@@ -944,6 +944,31 @@ describe("closed application protocol", () => {
     });
   });
 
+  it("treats a null authority context parameter as absent without throwing", () => {
+    const byType = (type: MutationCommandType): MutationAuthorityCase => {
+      const testCase = MUTATION_AUTHORITY_CASES.find(
+        (candidate) => candidate.command.type === type,
+      );
+      if (testCase === undefined) throw new Error(`Missing authority case for ${type}`);
+      return testCase;
+    };
+    const expected = {
+      ok: false,
+      error: { code: "missing_authority_context", field: "workspaceId" },
+    } as const;
+
+    for (const type of ["session.trash.restore", "run.prompt"] as const) {
+      const command = byType(type).command;
+      expect(resolveCommandAuthority(command, undefined), `${type} undefined context`).toEqual(
+        expected,
+      );
+      expect(
+        resolveCommandAuthority(command, null as unknown as CommandAuthorityContext),
+        `${type} null context`,
+      ).toEqual(expected);
+    }
+  });
+
   it("keeps every wire object closed except intentional JsonValue records", () => {
     const visited = new Set<object>();
     const visit = (schema: unknown): void => {
