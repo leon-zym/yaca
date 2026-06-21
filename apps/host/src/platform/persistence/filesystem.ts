@@ -16,6 +16,7 @@ export type PersistenceOperation =
   | "rename"
   | "directory-fsync"
   | "directory-fsync-complete"
+  | "operation-return"
   | "corrupt-tail-verified";
 
 export interface PersistenceFaultContext {

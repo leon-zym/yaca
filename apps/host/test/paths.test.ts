@@ -109,26 +109,33 @@ describe("yaca persistence paths", () => {
     await writeFile(protectedFile, protectedBytes, { mode: 0o640 });
     const userBefore = await lstat(userDirectory);
     const fileBefore = await lstat(protectedFile);
+    let stagingPath: string | undefined;
 
     await expect(
       prepareYacaPaths({
         root: requestedRoot,
         faultInjector: async (operation, context) => {
-          if (operation !== "directory-created" || context.name !== "root") return;
-          expect((await lstat(requestedRoot)).mode & 0o777).toBe(0o700);
-          await rename(requestedRoot, createdRoot);
-          await rename(userDirectory, requestedRoot);
+          if (operation !== "directory-staging-bound" || context.name !== "root") return;
+          const stagingName = (await readdir(base)).find((name) =>
+            name.startsWith(".data.staging-"),
+          );
+          expect(stagingName).toBeDefined();
+          stagingPath = join(base, stagingName!);
+          expect((await lstat(stagingPath)).mode & 0o777).toBe(0o700);
+          await rename(stagingPath, createdRoot);
+          await rename(userDirectory, stagingPath);
         },
       }),
     ).rejects.toThrow();
 
-    const userAfter = await lstat(requestedRoot);
-    const fileAfter = await lstat(join(requestedRoot, "protected.txt"));
+    expect(stagingPath).toBeDefined();
+    const userAfter = await lstat(stagingPath!);
+    const fileAfter = await lstat(join(stagingPath!, "protected.txt"));
     expect(userAfter.ino).toBe(userBefore.ino);
     expect(userAfter.mode).toBe(userBefore.mode);
     expect(fileAfter.ino).toBe(fileBefore.ino);
     expect(fileAfter.mode).toBe(fileBefore.mode);
-    await expect(readFile(join(requestedRoot, "protected.txt"))).resolves.toEqual(protectedBytes);
+    await expect(readFile(join(stagingPath!, "protected.txt"))).resolves.toEqual(protectedBytes);
     expect(await readdir(createdRoot)).toEqual([]);
   });
 
@@ -145,27 +152,33 @@ describe("yaca persistence paths", () => {
     await writeFile(protectedFile, protectedBytes, { mode: 0o640 });
     const userBefore = await lstat(userDirectory);
     const fileBefore = await lstat(protectedFile);
+    let stagingPath: string | undefined;
 
     await expect(
       prepareYacaPaths({
         root: requestedRoot,
         faultInjector: async (operation, context) => {
-          if (operation !== "directory-created" || context.name !== "agent") return;
-          expect((await lstat(join(requestedRoot, "agent"))).mode & 0o777).toBe(0o700);
-          await rename(join(requestedRoot, "agent"), createdAgent);
-          await rename(userDirectory, join(requestedRoot, "agent"));
+          if (operation !== "directory-staging-bound" || context.name !== "agent") return;
+          const stagingName = (await readdir(requestedRoot)).find((name) =>
+            name.startsWith(".agent.staging-"),
+          );
+          expect(stagingName).toBeDefined();
+          stagingPath = join(requestedRoot, stagingName!);
+          expect((await lstat(stagingPath)).mode & 0o777).toBe(0o700);
+          await rename(stagingPath, createdAgent);
+          await rename(userDirectory, stagingPath);
         },
       }),
     ).rejects.toThrow();
 
-    const visibleAgent = join(requestedRoot, "agent");
-    const userAfter = await lstat(visibleAgent);
-    const fileAfter = await lstat(join(visibleAgent, "protected.txt"));
+    expect(stagingPath).toBeDefined();
+    const userAfter = await lstat(stagingPath!);
+    const fileAfter = await lstat(join(stagingPath!, "protected.txt"));
     expect(userAfter.ino).toBe(userBefore.ino);
     expect(userAfter.mode).toBe(userBefore.mode);
     expect(fileAfter.ino).toBe(fileBefore.ino);
     expect(fileAfter.mode).toBe(fileBefore.mode);
-    await expect(readFile(join(visibleAgent, "protected.txt"))).resolves.toEqual(protectedBytes);
+    await expect(readFile(join(stagingPath!, "protected.txt"))).resolves.toEqual(protectedBytes);
     expect(await readdir(createdAgent)).toEqual([]);
   });
 
@@ -212,6 +225,121 @@ describe("yaca persistence paths", () => {
       expect(await readdir(originalRoot)).toEqual(originalChildren);
     },
   );
+
+  test("revalidates an earlier child at every later runtime checkpoint", async () => {
+    const base = await mkdtemp(join(tmpdir(), "yaca-runtime-child-swap-"));
+    temporaryRoots.push(base);
+    const requestedRoot = join(base, "data");
+    const originalAgent = join(base, "original-agent");
+    const replacementAgent = join(base, "replacement-agent");
+    const protectedFile = join(replacementAgent, "protected.txt");
+    const protectedBytes = Buffer.from("protected earlier child bytes\n");
+    await mkdir(replacementAgent, { mode: 0o700 });
+    await writeFile(protectedFile, protectedBytes, { mode: 0o600 });
+    const replacementBefore = await lstat(replacementAgent);
+    const protectedBefore = await lstat(protectedFile);
+
+    await expect(
+      prepareYacaPaths({
+        root: requestedRoot,
+        faultInjector: async (operation, context) => {
+          if (operation !== "runtime-child-parent" || context.name !== "app") return;
+          await rename(join(requestedRoot, "agent"), originalAgent);
+          await rename(replacementAgent, join(requestedRoot, "agent"));
+        },
+      }),
+    ).rejects.toThrow();
+
+    const visibleAgent = join(requestedRoot, "agent");
+    const replacementAfter = await lstat(visibleAgent);
+    const protectedAfter = await lstat(join(visibleAgent, "protected.txt"));
+    expect(replacementAfter.ino).toBe(replacementBefore.ino);
+    expect(replacementAfter.mode).toBe(replacementBefore.mode);
+    expect(protectedAfter.ino).toBe(protectedBefore.ino);
+    expect(protectedAfter.mode).toBe(protectedBefore.mode);
+    await expect(readFile(join(visibleAgent, "protected.txt"))).resolves.toEqual(protectedBytes);
+    expect(await readdir(originalAgent)).toEqual([]);
+  });
+
+  test("rejects a target installed before staging commit without changing it", async () => {
+    const base = await mkdtemp(join(tmpdir(), "yaca-runtime-target-swap-"));
+    temporaryRoots.push(base);
+    const requestedRoot = join(base, "data");
+    const target = join(requestedRoot, "agent");
+    const protectedBytes = Buffer.from("protected target bytes\n");
+    let targetBefore: Awaited<ReturnType<typeof lstat>> | undefined;
+
+    await expect(
+      prepareYacaPaths({
+        root: requestedRoot,
+        faultInjector: async (operation, context) => {
+          if (operation !== "directory-before-commit" || context.name !== "agent") return;
+          await mkdir(target, { mode: 0o755 });
+          await chmod(target, 0o755);
+          await writeFile(join(target, "protected.txt"), protectedBytes, { mode: 0o640 });
+          targetBefore = await lstat(target);
+        },
+      }),
+    ).rejects.toThrow();
+
+    expect(targetBefore).toBeDefined();
+    const targetAfter = await lstat(target);
+    expect(targetAfter.ino).toBe(targetBefore!.ino);
+    expect(targetAfter.mode).toBe(targetBefore!.mode);
+    await expect(readFile(join(target, "protected.txt"))).resolves.toEqual(protectedBytes);
+    expect(await readdir(target)).toEqual(["protected.txt"]);
+    const retainedStaging = (await readdir(requestedRoot)).find((name) =>
+      name.startsWith(".agent.staging-"),
+    );
+    expect(retainedStaging).toBeDefined();
+    expect((await lstat(join(requestedRoot, retainedStaging!))).mode & 0o777).toBe(0o700);
+    expect(await readdir(join(requestedRoot, retainedStaging!))).toEqual([]);
+  });
+
+  test("attempts every authority close when one injected close fails", async () => {
+    const base = await mkdtemp(join(tmpdir(), "yaca-runtime-close-"));
+    temporaryRoots.push(base);
+    const closed: string[] = [];
+
+    await expect(
+      prepareYacaPaths({
+        root: join(base, "data"),
+        faultInjector: (operation, context) => {
+          if (operation !== "directory-close") return;
+          closed.push(context.name);
+          if (context.name === "root") throw new Error("injected root close failure");
+        },
+      }),
+    ).rejects.toThrow("injected root close failure");
+
+    expect(closed.sort()).toEqual(
+      [
+        "root-parent",
+        "root",
+        "agent",
+        "app",
+        "content",
+        "trash",
+        "logs",
+        "run",
+        "temporary",
+      ].sort(),
+    );
+  });
+
+  test("prepares a fresh tree under a restrictive umask", async () => {
+    const base = await mkdtemp(join(tmpdir(), "yaca-runtime-umask-"));
+    temporaryRoots.push(base);
+    const previousUmask = process.umask(0o077);
+    try {
+      const paths = await prepareYacaPaths({ root: join(base, "data") });
+      await expect(
+        Promise.all(Object.values(paths).map(async (path) => (await stat(path)).mode & 0o777)),
+      ).resolves.toEqual([0o700, 0o700, 0o700, 0o700, 0o700, 0o700, 0o700, 0o700]);
+    } finally {
+      process.umask(previousUmask);
+    }
+  });
 
   test("rejects an existing root with unsafe permissions without repairing it", async () => {
     const parent = await mkdtemp(join(tmpdir(), "yaca-root-existing-mode-"));

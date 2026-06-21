@@ -152,6 +152,7 @@ export class AtomicJsonFile<T> {
       await syncDirectoryHandle(directoryHandle, this.#options.faultInjector, async () => {
         await this.#verifyAfterRename(target, committedHandle, committedIdentity);
       });
+      await injectFault(this.#options.faultInjector, "operation-return");
       await this.#verifyAfterRename(target, committedHandle, committedIdentity);
     } catch (error) {
       const failure = persistenceError(error);

@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
-import { lstat, mkdir, open, realpath, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, rename, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -24,11 +25,13 @@ export interface PrepareYacaPathsOptions {
 
 export type YacaPathOperation =
   | "directory-before-create"
-  | "directory-created"
-  | "runtime-child-parent";
+  | "directory-staging-bound"
+  | "directory-before-commit"
+  | "runtime-child-parent"
+  | "directory-close";
 
 export interface YacaPathFaultContext {
-  readonly name: keyof YacaPaths;
+  readonly name: keyof YacaPaths | "root-parent";
 }
 
 export type YacaPathFaultInjector = (
@@ -60,6 +63,12 @@ interface ParentIdentity {
 interface VerifiedParent {
   readonly identity: ParentIdentity;
   readonly handle: FileHandle;
+}
+
+interface AuthorityRecord {
+  readonly name: YacaPathFaultContext["name"];
+  readonly authority: VerifiedParent;
+  readonly runtime: boolean;
 }
 
 function assertContained(root: string, candidate: string, name: string): void {
@@ -121,14 +130,20 @@ async function createPrivateDirectory(
   parent: VerifiedParent,
   injector?: YacaPathFaultInjector,
 ): Promise<CreatedDirectory> {
+  const stagingPath = join(
+    parent.identity.canonicalPath,
+    `.${basename(requestedPath)}.staging-${randomUUID()}`,
+  );
   await verifyParent(parent);
+  await verifyMissingDirectory(requestedPath, name, root, parent);
   await injector?.("directory-before-create", { name: contextName });
-  // ADR-0005 records Node's missing descriptor-relative mkdir. This final
-  // identity check rejects every visible parent replacement before mkdir;
-  // only an active same-UID check-to-syscall race remains out of scope.
+  // Node has no descriptor-relative mkdir. ADR-0005 must therefore include
+  // only the exact same-UID race from unpredictable staging creation to its
+  // first descriptor binding; no visible fault checkpoint exists in it.
   await verifyParent(parent);
+  await verifyMissingDirectory(requestedPath, name, root, parent);
   try {
-    await mkdir(requestedPath, { mode: DIRECTORY_MODE });
+    await mkdir(stagingPath, { mode: DIRECTORY_MODE });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
       throw unsafeDirectoryError(name, root);
@@ -136,25 +151,49 @@ async function createPrivateDirectory(
     throw error;
   }
 
-  const pathBefore = await lstat(requestedPath, { bigint: true });
-  assertPrivateDirectory(pathBefore, name, root, true);
+  const pathBefore = await lstat(stagingPath, { bigint: true });
+  assertStagingDirectory(pathBefore, name, root);
   await verifyParent(parent);
-  if ((await realpath(requestedPath)) !== expectedCanonicalPath) {
+  if ((await realpath(stagingPath)) !== stagingPath) {
     throw unsafeDirectoryError(name, root);
   }
 
   let handle: FileHandle | undefined;
   try {
     handle = await open(
-      requestedPath,
+      stagingPath,
       constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
     );
     const descriptorBefore = await handle.stat({ bigint: true });
-    assertPrivateDirectory(descriptorBefore, name, root, true);
+    assertStagingDirectory(descriptorBefore, name, root);
     assertSameDirectory(pathBefore, descriptorBefore, name, root);
     await verifyCreatedDirectory(
-      requestedPath,
-      expectedCanonicalPath,
+      stagingPath,
+      stagingPath,
+      name,
+      root,
+      parent,
+      handle,
+      descriptorBefore,
+      false,
+    );
+    await injector?.("directory-staging-bound", { name: contextName });
+    await verifyCreatedDirectory(
+      stagingPath,
+      stagingPath,
+      name,
+      root,
+      parent,
+      handle,
+      descriptorBefore,
+      false,
+    );
+    if ((descriptorBefore.mode & 0o777n) !== BigInt(DIRECTORY_MODE)) {
+      await handle.chmod(DIRECTORY_MODE);
+    }
+    await verifyCreatedDirectory(
+      stagingPath,
+      stagingPath,
       name,
       root,
       parent,
@@ -162,7 +201,21 @@ async function createPrivateDirectory(
       descriptorBefore,
       true,
     );
-    await injector?.("directory-created", { name: contextName });
+    await injector?.("directory-before-commit", { name: contextName });
+    await verifyCreatedDirectory(
+      stagingPath,
+      stagingPath,
+      name,
+      root,
+      parent,
+      handle,
+      descriptorBefore,
+      true,
+    );
+    await verifyMissingDirectory(requestedPath, name, root, parent);
+    // ADR-0005 excludes only an active same-UID exchange after this final
+    // target check and before the immediately following path rename.
+    await rename(stagingPath, requestedPath);
     await verifyCreatedDirectory(
       requestedPath,
       expectedCanonicalPath,
@@ -173,8 +226,11 @@ async function createPrivateDirectory(
       descriptorBefore,
       true,
     );
+    const descriptorAfter = await handle.stat({ bigint: true });
+    assertPrivateDirectory(descriptorAfter, name, root, true);
+    assertSameDirectory(descriptorBefore, descriptorAfter, name, root);
     const authority = {
-      identity: parentIdentity(expectedCanonicalPath, descriptorBefore),
+      identity: parentIdentity(expectedCanonicalPath, descriptorAfter),
       handle,
     };
     handle = undefined;
@@ -182,6 +238,22 @@ async function createPrivateDirectory(
   } finally {
     await handle?.close();
   }
+}
+
+async function verifyMissingDirectory(
+  requestedPath: string,
+  name: string,
+  root: boolean,
+  parent: VerifiedParent,
+): Promise<void> {
+  await verifyParent(parent);
+  try {
+    await lstat(requestedPath);
+    throw unsafeDirectoryError(name, root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await verifyParent(parent);
 }
 
 async function openVerifiedParent(path: string): Promise<VerifiedParent> {
@@ -260,15 +332,60 @@ async function verifyCreatedDirectory(
 ): Promise<void> {
   await verifyParent(parent);
   const descriptor = await handle.stat({ bigint: true });
-  assertPrivateDirectory(descriptor, name, root, requireMode);
+  if (requireMode) assertPrivateDirectory(descriptor, name, root, true);
+  else assertStagingDirectory(descriptor, name, root);
   assertSameDirectory(expected, descriptor, name, root);
   const pathStat = await lstat(requestedPath, { bigint: true });
-  assertPrivateDirectory(pathStat, name, root, requireMode);
+  if (requireMode) assertPrivateDirectory(pathStat, name, root, true);
+  else assertStagingDirectory(pathStat, name, root);
   assertSameDirectory(descriptor, pathStat, name, root);
   if ((await realpath(requestedPath)) !== expectedCanonicalPath) {
     throw unsafeDirectoryError(name, root);
   }
   await verifyParent(parent);
+}
+
+function assertStagingDirectory(stat: BigIntStats, name: string, root: boolean): void {
+  assertPrivateDirectory(stat, name, root, false);
+  if ((stat.mode & 0o077n) !== 0n) throw unsafeDirectoryError(name, root);
+}
+
+async function verifyRuntimeAuthorities(records: readonly AuthorityRecord[]): Promise<void> {
+  for (const record of records) {
+    if (record.runtime) await verifyParent(record.authority);
+  }
+}
+
+async function closeAuthorities(
+  records: readonly AuthorityRecord[],
+  injector?: YacaPathFaultInjector,
+): Promise<void> {
+  const results = await Promise.allSettled(
+    records.map(async ({ name, authority }) => {
+      let injectedFailure: unknown;
+      let injectionFailed = false;
+      try {
+        await injector?.("directory-close", { name });
+      } catch (error) {
+        injectionFailed = true;
+        injectedFailure = error;
+      }
+      let closeFailure: unknown;
+      let closeFailed = false;
+      try {
+        await authority.handle.close();
+      } catch (error) {
+        closeFailed = true;
+        closeFailure = error;
+      }
+      if (injectionFailed) throw injectedFailure;
+      if (closeFailed) throw closeFailure;
+    }),
+  );
+  const failure = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failure) throw failure.reason;
 }
 
 function assertPrivateDirectory(
@@ -314,15 +431,18 @@ export async function prepareYacaPaths(options: PrepareYacaPathsOptions = {}): P
   const requestedRoot = resolve(options.root ?? join(options.home ?? homedir(), ".yaca"));
   const canonicalParent = await realpath(dirname(requestedRoot));
   const expectedRoot = join(canonicalParent, basename(requestedRoot));
+  const authorities: AuthorityRecord[] = [];
   const rootParent = await openVerifiedParent(canonicalParent);
-  let root: string;
-  let rootAuthority: VerifiedParent | undefined;
+  authorities.push({ name: "root-parent", authority: rootParent, runtime: false });
   try {
     await verifyParent(rootParent);
     const observedRoot = await observeDirectory(expectedRoot, expectedRoot, "root", true);
+    let root: string;
+    let rootAuthority: VerifiedParent;
     if (observedRoot.kind === "existing") {
       root = observedRoot.canonicalPath;
       rootAuthority = observedRoot.authority;
+      authorities.push({ name: "root", authority: rootAuthority, runtime: true });
       await verifyParent(rootParent);
     } else {
       const createdRoot = await createPrivateDirectory(
@@ -336,41 +456,31 @@ export async function prepareYacaPaths(options: PrepareYacaPathsOptions = {}): P
       );
       root = createdRoot.canonicalPath;
       rootAuthority = createdRoot.authority;
+      authorities.push({ name: "root", authority: rootAuthority, runtime: true });
     }
-  } catch (error) {
-    await rootAuthority?.handle.close().catch(() => undefined);
-    throw error;
-  } finally {
-    await rootParent.handle.close();
-  }
-  if (!rootAuthority) throw new Error("yaca data root authority was not established");
 
-  const definitions = [
-    ["agent", "agent"],
-    ["app", "app"],
-    ["content", "content"],
-    ["trash", "trash"],
-    ["logs", "logs"],
-    ["run", "run"],
-    ["temporary", "tmp"],
-  ] as const;
-  const prepared: Array<readonly [keyof Omit<YacaPaths, "root">, string]> = [];
-  try {
+    const definitions = [
+      ["agent", "agent"],
+      ["app", "app"],
+      ["content", "content"],
+      ["trash", "trash"],
+      ["logs", "logs"],
+      ["run", "run"],
+      ["temporary", "tmp"],
+    ] as const;
+    const prepared: Array<readonly [keyof Omit<YacaPaths, "root">, string]> = [];
     for (const [key, leaf] of definitions) {
       await options.faultInjector?.("runtime-child-parent", { name: key });
-      await verifyParent(rootAuthority);
+      await verifyRuntimeAuthorities(authorities);
       const requestedPath = join(root, leaf);
       const observation = await observeDirectory(requestedPath, requestedPath, leaf, false);
       let canonicalPath: string;
+      let childAuthority: VerifiedParent;
       if (observation.kind === "existing") {
-        try {
-          await verifyParent(rootAuthority);
-          canonicalPath = observation.canonicalPath;
-        } finally {
-          await observation.authority.handle.close();
-        }
+        canonicalPath = observation.canonicalPath;
+        childAuthority = observation.authority;
       } else {
-        await verifyParent(rootAuthority);
+        await verifyRuntimeAuthorities(authorities);
         const created = await createPrivateDirectory(
           requestedPath,
           requestedPath,
@@ -381,16 +491,17 @@ export async function prepareYacaPaths(options: PrepareYacaPathsOptions = {}): P
           options.faultInjector,
         );
         canonicalPath = created.canonicalPath;
-        await created.authority.handle.close();
+        childAuthority = created.authority;
       }
-      await verifyParent(rootAuthority);
+      authorities.push({ name: key, authority: childAuthority, runtime: true });
+      await verifyRuntimeAuthorities(authorities);
       assertContained(root, canonicalPath, leaf);
       prepared.push([key, canonicalPath]);
     }
-    await verifyParent(rootAuthority);
+    await verifyRuntimeAuthorities(authorities);
     const paths = Object.fromEntries(prepared) as Omit<YacaPaths, "root">;
     return { root, ...paths };
   } finally {
-    await rootAuthority.handle.close();
+    await closeAuthorities(authorities, options.faultInjector);
   }
 }

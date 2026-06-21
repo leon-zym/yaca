@@ -229,6 +229,7 @@ export class DurableJsonl<T> {
       await syncDirectoryHandle(directoryHandle, this.#options.faultInjector, () =>
         this.#verifyAppendIdentity(target, handle!, descriptor),
       );
+      await injectFault(this.#options.faultInjector, "operation-return");
       await this.#verifyAppendIdentity(target, handle, descriptor);
     } catch (error) {
       this.#status = "degraded";
