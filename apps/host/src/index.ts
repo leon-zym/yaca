@@ -2,6 +2,8 @@ export { LOOPBACK_HOST, startHost, type RunningHost, type StartHostOptions } fro
 export {
   prepareYacaPaths,
   type PrepareYacaPathsOptions,
+  YacaPathError,
+  type YacaPathErrorCode,
   type YacaPathFaultContext,
   type YacaPathFaultInjector,
   type YacaPathOperation,
