@@ -219,6 +219,7 @@ export class DurableJsonl<T> {
       await injectFault(this.#options.faultInjector, "file-fsync");
       await this.#verifyAppendIdentity(target, handle, descriptor);
       await handle.sync();
+      await injectFault(this.#options.faultInjector, "file-fsync-complete");
       await this.#verifyAppendIdentity(target, handle, descriptor);
       const durable = await handle.stat({ bigint: true });
       assertSafeFile(durable, target.parent.device);

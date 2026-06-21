@@ -9,11 +9,13 @@ export type PersistenceOperation =
   | "append-open"
   | "write"
   | "file-fsync"
+  | "file-fsync-complete"
   | "temporary-create"
   | "temporary-opened"
   | "temporary-cleanup"
   | "rename"
   | "directory-fsync"
+  | "directory-fsync-complete"
   | "corrupt-tail-verified";
 
 export interface PersistenceFaultContext {
@@ -205,6 +207,7 @@ export async function syncDirectoryHandle(
   await injectFault(injector, "directory-fsync");
   await verify?.();
   await handle.sync();
+  await injectFault(injector, "directory-fsync-complete");
   await verify?.();
 }
 

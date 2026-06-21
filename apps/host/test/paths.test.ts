@@ -115,6 +115,7 @@ describe("yaca persistence paths", () => {
         root: requestedRoot,
         faultInjector: async (operation, context) => {
           if (operation !== "directory-created" || context.name !== "root") return;
+          expect((await lstat(requestedRoot)).mode & 0o777).toBe(0o700);
           await rename(requestedRoot, createdRoot);
           await rename(userDirectory, requestedRoot);
         },
@@ -150,6 +151,7 @@ describe("yaca persistence paths", () => {
         root: requestedRoot,
         faultInjector: async (operation, context) => {
           if (operation !== "directory-created" || context.name !== "agent") return;
+          expect((await lstat(join(requestedRoot, "agent"))).mode & 0o777).toBe(0o700);
           await rename(join(requestedRoot, "agent"), createdAgent);
           await rename(userDirectory, join(requestedRoot, "agent"));
         },
@@ -166,6 +168,50 @@ describe("yaca persistence paths", () => {
     await expect(readFile(join(visibleAgent, "protected.txt"))).resolves.toEqual(protectedBytes);
     expect(await readdir(createdAgent)).toEqual([]);
   });
+
+  test.each([
+    { swapAt: "agent" as const, originalChildren: [] },
+    { swapAt: "app" as const, originalChildren: ["agent"] },
+  ])(
+    "keeps one root authority when replacement occurs before $swapAt preparation",
+    async ({ swapAt, originalChildren }) => {
+      const base = await mkdtemp(join(tmpdir(), "yaca-runtime-root-swap-"));
+      temporaryRoots.push(base);
+      const requestedRoot = join(base, "data");
+      const originalRoot = join(base, "original-root");
+      const replacementRoot = join(base, "replacement-root");
+      const protectedFile = join(replacementRoot, "protected.txt");
+      const protectedBytes = Buffer.from("protected runtime root bytes\n");
+      await mkdir(replacementRoot, { mode: 0o700 });
+      await chmod(replacementRoot, 0o700);
+      await writeFile(protectedFile, protectedBytes, { mode: 0o600 });
+      const replacementBefore = await lstat(replacementRoot);
+      const protectedBefore = await lstat(protectedFile);
+      let swapped = false;
+
+      await expect(
+        prepareYacaPaths({
+          root: requestedRoot,
+          faultInjector: async (operation, context) => {
+            if (operation !== "runtime-child-parent" || context.name !== swapAt || swapped) return;
+            swapped = true;
+            await rename(requestedRoot, originalRoot);
+            await rename(replacementRoot, requestedRoot);
+          },
+        }),
+      ).rejects.toThrow();
+
+      const replacementAfter = await lstat(requestedRoot);
+      const protectedAfter = await lstat(join(requestedRoot, "protected.txt"));
+      expect(replacementAfter.ino).toBe(replacementBefore.ino);
+      expect(replacementAfter.mode).toBe(replacementBefore.mode);
+      expect(protectedAfter.ino).toBe(protectedBefore.ino);
+      expect(protectedAfter.mode).toBe(protectedBefore.mode);
+      await expect(readFile(join(requestedRoot, "protected.txt"))).resolves.toEqual(protectedBytes);
+      expect(await readdir(requestedRoot)).toEqual(["protected.txt"]);
+      expect(await readdir(originalRoot)).toEqual(originalChildren);
+    },
+  );
 
   test("rejects an existing root with unsafe permissions without repairing it", async () => {
     const parent = await mkdtemp(join(tmpdir(), "yaca-root-existing-mode-"));

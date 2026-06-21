@@ -124,6 +124,7 @@ export class AtomicJsonFile<T> {
         initialLeaf,
       );
       await handle.sync();
+      await injectFault(this.#options.faultInjector, "file-fsync-complete");
       const durableTemporary = await handle.stat({ bigint: true });
       assertSafeFile(durableTemporary, target.parent.device);
       this.#assertSameFile(temporaryIdentity, durableTemporary);
