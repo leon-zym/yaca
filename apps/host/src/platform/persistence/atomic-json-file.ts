@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
-import { open, rename, rm } from "node:fs/promises";
+import { open, rename, rm, type FileHandle } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { PersistenceError, persistenceError } from "./errors.js";
 import {
@@ -29,7 +29,7 @@ export class AtomicJsonFile<T> {
 
   async read(): Promise<T | undefined> {
     const target = await resolveReadOnlyTarget(this.#requestedPath);
-    let handle;
+    let handle: FileHandle | undefined;
     let directoryHandle;
     try {
       directoryHandle = await openVerifiedDirectory(target);
@@ -74,9 +74,10 @@ export class AtomicJsonFile<T> {
     const temporaryPath = join(target.directory, `.${basename(target.path)}.tmp-${randomUUID()}`);
     const retainedTemporaryId = randomUUID();
     const temporaryTarget = { ...target, path: temporaryPath };
-    let handle;
+    let handle: FileHandle | undefined;
     let directoryHandle;
-    let temporaryIdentity;
+    let temporaryIdentity: BigIntStats | undefined;
+    let temporaryOpened = false;
     let renamed = false;
 
     try {
@@ -92,36 +93,65 @@ export class AtomicJsonFile<T> {
         constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
         0o600,
       );
+      temporaryOpened = true;
+      await injectFault(this.#options.faultInjector, "temporary-opened");
       temporaryIdentity = await handle.stat({ bigint: true });
       assertSafeFile(temporaryIdentity, target.parent.device);
       await verifyFilePath(temporaryTarget, temporaryIdentity);
       await verifyLeafState(target, initialLeaf);
       await injectFault(this.#options.faultInjector, "write");
-      await verifyLeafState(target, initialLeaf);
+      await this.#verifyBeforeRename(
+        target,
+        temporaryTarget,
+        handle,
+        temporaryIdentity,
+        initialLeaf,
+      );
       await handle.writeFile(bytes);
+      await this.#verifyBeforeRename(
+        target,
+        temporaryTarget,
+        handle,
+        temporaryIdentity,
+        initialLeaf,
+      );
       await injectFault(this.#options.faultInjector, "file-fsync");
-      await verifyLeafState(target, initialLeaf);
+      await this.#verifyBeforeRename(
+        target,
+        temporaryTarget,
+        handle,
+        temporaryIdentity,
+        initialLeaf,
+      );
       await handle.sync();
       const durableTemporary = await handle.stat({ bigint: true });
       assertSafeFile(durableTemporary, target.parent.device);
-      if (
-        temporaryIdentity.dev !== durableTemporary.dev ||
-        temporaryIdentity.ino !== durableTemporary.ino
-      ) {
-        throw new PersistenceError("io_failure");
-      }
+      this.#assertSameFile(temporaryIdentity, durableTemporary);
       temporaryIdentity = durableTemporary;
-      await verifyFilePath(temporaryTarget, temporaryIdentity);
-      await verifyLeafState(target, initialLeaf);
+      await this.#verifyBeforeRename(
+        target,
+        temporaryTarget,
+        handle,
+        temporaryIdentity,
+        initialLeaf,
+      );
       await injectFault(this.#options.faultInjector, "rename");
-      await verifyDirectoryIdentity(target);
-      await verifyFilePath(temporaryTarget, temporaryIdentity);
-      await verifyLeafState(target, initialLeaf);
+      await this.#verifyBeforeRename(
+        target,
+        temporaryTarget,
+        handle,
+        temporaryIdentity,
+        initialLeaf,
+      );
       await rename(temporaryPath, target.path);
       renamed = true;
-      await verifyDirectoryIdentity(target);
-      await verifyFilePath(target, temporaryIdentity);
-      await syncDirectoryHandle(directoryHandle, this.#options.faultInjector);
+      const committedIdentity = temporaryIdentity;
+      const committedHandle = handle;
+      await this.#verifyAfterRename(target, committedHandle, committedIdentity);
+      await syncDirectoryHandle(directoryHandle, this.#options.faultInjector, async () => {
+        await this.#verifyAfterRename(target, committedHandle, committedIdentity);
+      });
+      await this.#verifyAfterRename(target, committedHandle, committedIdentity);
     } catch (error) {
       const failure = persistenceError(error);
       try {
@@ -130,11 +160,10 @@ export class AtomicJsonFile<T> {
         // Preserve the operation failure; cleanup is best effort.
       }
       let retainedTemporary = false;
-      if (!renamed && temporaryIdentity) {
-        retainedTemporary = !(await this.#removeTemporaryIfStillOwned(
-          temporaryTarget,
-          temporaryIdentity,
-        ));
+      if (!renamed && temporaryOpened) {
+        retainedTemporary = temporaryIdentity
+          ? !(await this.#removeTemporaryIfStillOwned(temporaryTarget, temporaryIdentity))
+          : true;
       }
       if (retainedTemporary) {
         throw new PersistenceError(failure.code, {
@@ -146,6 +175,48 @@ export class AtomicJsonFile<T> {
     } finally {
       await handle?.close().catch(() => undefined);
       await directoryHandle?.close().catch(() => undefined);
+    }
+  }
+
+  async #verifyBeforeRename(
+    target: Awaited<ReturnType<typeof resolveReadOnlyTarget>>,
+    temporaryTarget: Awaited<ReturnType<typeof resolveReadOnlyTarget>>,
+    handle: FileHandle,
+    expected: BigIntStats,
+    initialLeaf: Awaited<ReturnType<typeof captureLeafState>>,
+  ): Promise<void> {
+    await verifyLeafState(target, initialLeaf);
+    await this.#verifyOpenedPath(temporaryTarget, handle, expected);
+  }
+
+  async #verifyAfterRename(
+    target: Awaited<ReturnType<typeof resolveReadOnlyTarget>>,
+    handle: FileHandle,
+    expected: BigIntStats,
+  ): Promise<void> {
+    await this.#verifyOpenedPath(target, handle, expected);
+  }
+
+  async #verifyOpenedPath(
+    target: Awaited<ReturnType<typeof resolveReadOnlyTarget>>,
+    handle: FileHandle,
+    expected: BigIntStats,
+  ): Promise<void> {
+    const descriptor = await handle.stat({ bigint: true });
+    assertSafeFile(descriptor, target.parent.device);
+    this.#assertSameFile(expected, descriptor);
+    await verifyFilePath(target, descriptor);
+  }
+
+  #assertSameFile(expected: BigIntStats, actual: BigIntStats): void {
+    if (
+      expected.dev !== actual.dev ||
+      expected.ino !== actual.ino ||
+      expected.uid !== actual.uid ||
+      expected.nlink !== actual.nlink ||
+      (expected.mode & 0o777n) !== (actual.mode & 0o777n)
+    ) {
+      throw new PersistenceError("io_failure");
     }
   }
 

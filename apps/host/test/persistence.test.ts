@@ -190,6 +190,91 @@ describe("AtomicJsonFile", () => {
     expect(await readdir(join(root, "original-state"))).toEqual([]);
   });
 
+  test.each(["write", "file-fsync"] as const)(
+    "does not mutate a temporary moved at the %s checkpoint",
+    async (checkpoint) => {
+      const directory = await temporaryDirectory(`yaca-atomic-${checkpoint}-temp-`);
+      const externalDirectory = await temporaryDirectory(`yaca-atomic-${checkpoint}-external-`);
+      const target = join(directory, "state.json");
+      let movedPath: string | undefined;
+      let movedBefore: Awaited<ReturnType<typeof lstat>> | undefined;
+      let movedBytes: Buffer | undefined;
+      const file = new AtomicJsonFile(target, {
+        faultInjector: async (operation) => {
+          if (operation !== checkpoint || movedPath) return;
+          const temporaryName = (await readdir(directory)).find((name) => name.includes(".tmp-"));
+          expect(temporaryName).toBeDefined();
+          movedPath = join(externalDirectory, temporaryName!);
+          await rename(join(directory, temporaryName!), movedPath);
+          movedBefore = await lstat(movedPath);
+          movedBytes = await readFile(movedPath);
+        },
+      });
+
+      const failure = await file.replace({ revision: 1 }).catch((error: unknown) => error);
+
+      expect(failure).toMatchObject({
+        code: "io_failure",
+        diagnostic: { kind: "retained_temporary" },
+      });
+      const movedAfter = await lstat(movedPath!);
+      expect(movedAfter.ino).toBe(movedBefore!.ino);
+      expect(movedAfter.mode).toBe(movedBefore!.mode);
+      await expect(readFile(movedPath!)).resolves.toEqual(movedBytes);
+    },
+  );
+
+  test("rejects a target replacement returned from the directory-fsync checkpoint", async () => {
+    const directory = await temporaryDirectory("yaca-atomic-directory-target-");
+    const target = join(directory, "state.json");
+    const committedPath = join(directory, "committed-state.json");
+    const protectedBytes = Buffer.from('{"protected":true}\n');
+    await writeFile(target, '{"revision":0}\n', { mode: 0o600 });
+    let replaced = false;
+    const file = new AtomicJsonFile(target, {
+      faultInjector: async (operation) => {
+        if (operation !== "directory-fsync" || replaced) return;
+        replaced = true;
+        await rename(target, committedPath);
+        await writeFile(target, protectedBytes, { mode: 0o600 });
+      },
+    });
+
+    await expect(file.replace({ revision: 1 })).rejects.toMatchObject({ code: "io_failure" });
+
+    await expect(readFile(target)).resolves.toEqual(protectedBytes);
+    await expect(readFile(committedPath, "utf8")).resolves.toBe('{"revision":1}\n');
+  });
+
+  test("returns retained-temporary evidence when the first descriptor stat fails", async () => {
+    const directory = await temporaryDirectory("yaca-atomic-first-stat-");
+    const target = join(directory, "state.json");
+    let temporaryName: string | undefined;
+    const file = new AtomicJsonFile(target, {
+      faultInjector: async (operation) => {
+        if (operation !== "temporary-opened") return;
+        temporaryName = (await readdir(directory)).find((name) => name.includes(".tmp-"));
+        throw Object.assign(new Error("injected descriptor stat failure"), { code: "EIO" });
+      },
+    });
+
+    const failure = await file.replace({ revision: 1 }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({
+      code: "io_failure",
+      diagnostic: { kind: "retained_temporary", id: expect.any(String) },
+    });
+    expect(JSON.stringify((failure as { diagnostic: unknown }).diagnostic)).not.toContain(
+      directory,
+    );
+    expect(temporaryName).toBeDefined();
+    const retained = join(directory, temporaryName!);
+    expect((await lstat(retained)).mode & 0o777).toBe(0o600);
+    expect((await lstat(retained)).size).toBe(0);
+    await expect(new AtomicJsonFile(target).read()).resolves.toBeUndefined();
+    expect(await readdir(directory)).toEqual([temporaryName]);
+  });
+
   test("rejects unsafe existing permissions without repairing the file or parent", async () => {
     const root = await temporaryDirectory("yaca-atomic-mode-");
     const stateDirectory = join(root, "state");
@@ -432,7 +517,7 @@ describe("DurableJsonl", () => {
     await expect(readFile(externalTarget)).resolves.toEqual(protectedBytes);
   });
 
-  test("keeps appending through a verified descriptor after its parent path is replaced", async () => {
+  test("rejects a parent replacement returned from the write checkpoint", async () => {
     const root = await temporaryDirectory("yaca-jsonl-append-fd-");
     const journalDirectory = join(root, "journal");
     const externalDirectory = join(root, "external");
@@ -454,13 +539,46 @@ describe("DurableJsonl", () => {
     });
     await ledger.readValidPrefix();
 
-    await expect(ledger.append({ sequence: 1 })).resolves.toBeUndefined();
+    await expect(ledger.append({ sequence: 1 })).rejects.toMatchObject({ code: "io_failure" });
 
     await expect(readFile(join(root, "original-journal", "events.jsonl"), "utf8")).resolves.toBe(
-      '{"sequence":0}\n{"sequence":1}\n',
+      '{"sequence":0}\n',
     );
     await expect(readFile(externalTarget)).resolves.toEqual(protectedBytes);
+    expect(ledger.status).toBe("degraded");
+    await expect(ledger.append({ sequence: 2 })).rejects.toMatchObject({ code: "degraded" });
   });
+
+  test.each(["file-fsync", "directory-fsync"] as const)(
+    "rejects a canonical leaf replacement returned from the %s checkpoint",
+    async (checkpoint) => {
+      const directory = await temporaryDirectory(`yaca-jsonl-${checkpoint}-replacement-`);
+      const target = join(directory, "events.jsonl");
+      const originalPath = join(directory, "opened-events.jsonl");
+      const replacementBytes = Buffer.from('{"protected":true}\n');
+      await writeFile(target, '{"sequence":0}\n', { mode: 0o600 });
+      let replaced = false;
+      const ledger = new DurableJsonl<{ sequence: number }>(target, {
+        faultInjector: async (operation) => {
+          if (operation !== checkpoint || replaced) return;
+          replaced = true;
+          await rename(target, originalPath);
+          await writeFile(target, replacementBytes, { mode: 0o600 });
+        },
+      });
+      await ledger.readValidPrefix();
+
+      await expect(ledger.append({ sequence: 1 })).rejects.toMatchObject({ code: "io_failure" });
+
+      const replacement = await lstat(target);
+      expect(replacement.mode & 0o777).toBe(0o600);
+      await expect(readFile(target)).resolves.toEqual(replacementBytes);
+      await expect(readFile(originalPath, "utf8")).resolves.toBe(
+        '{"sequence":0}\n{"sequence":1}\n',
+      );
+      expect(ledger.status).toBe("degraded");
+    },
+  );
 
   test("does not create a missing ledger through a visibly swapped parent", async () => {
     const root = await temporaryDirectory("yaca-jsonl-create-swap-");

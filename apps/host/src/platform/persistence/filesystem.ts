@@ -10,6 +10,7 @@ export type PersistenceOperation =
   | "write"
   | "file-fsync"
   | "temporary-create"
+  | "temporary-opened"
   | "temporary-cleanup"
   | "rename"
   | "directory-fsync"
@@ -199,9 +200,12 @@ export async function rejectSymbolicLink(path: string): Promise<void> {
 export async function syncDirectoryHandle(
   handle: FileHandle,
   injector?: PersistenceFaultInjector,
+  verify?: () => Promise<void>,
 ): Promise<void> {
   await injectFault(injector, "directory-fsync");
+  await verify?.();
   await handle.sync();
+  await verify?.();
 }
 
 export function serializeJson(value: unknown): Buffer {

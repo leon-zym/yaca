@@ -213,15 +213,22 @@ export class DurableJsonl<T> {
       }
       await verifyFilePath(target, descriptor);
       await injectFault(this.#options.faultInjector, "write");
+      await this.#verifyAppendIdentity(target, handle, descriptor);
       await handle.writeFile(bytes);
+      await this.#verifyAppendIdentity(target, handle, descriptor);
       await injectFault(this.#options.faultInjector, "file-fsync");
+      await this.#verifyAppendIdentity(target, handle, descriptor);
       await handle.sync();
+      await this.#verifyAppendIdentity(target, handle, descriptor);
       const durable = await handle.stat({ bigint: true });
       assertSafeFile(durable, target.parent.device);
       if (durable.dev !== descriptor.dev || durable.ino !== descriptor.ino) {
         throw new PersistenceError("io_failure");
       }
-      await syncDirectoryHandle(directoryHandle, this.#options.faultInjector);
+      await syncDirectoryHandle(directoryHandle, this.#options.faultInjector, () =>
+        this.#verifyAppendIdentity(target, handle!, descriptor),
+      );
+      await this.#verifyAppendIdentity(target, handle, descriptor);
     } catch (error) {
       this.#status = "degraded";
       try {
@@ -234,6 +241,25 @@ export class DurableJsonl<T> {
       await handle?.close().catch(() => undefined);
       await directoryHandle?.close().catch(() => undefined);
     }
+  }
+
+  async #verifyAppendIdentity(
+    target: Awaited<ReturnType<typeof resolveReadOnlyTarget>>,
+    handle: NonNullable<Awaited<ReturnType<typeof open>>>,
+    expected: BigIntStats,
+  ): Promise<void> {
+    const descriptor = await handle.stat({ bigint: true });
+    assertSafeFile(descriptor, target.parent.device);
+    if (
+      descriptor.dev !== expected.dev ||
+      descriptor.ino !== expected.ino ||
+      descriptor.uid !== expected.uid ||
+      descriptor.nlink !== expected.nlink ||
+      (descriptor.mode & 0o777n) !== (expected.mode & 0o777n)
+    ) {
+      throw new PersistenceError("io_failure");
+    }
+    await verifyFilePath(target, descriptor);
   }
 
   async #readCorruptTail(

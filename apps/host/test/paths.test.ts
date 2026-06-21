@@ -7,6 +7,7 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   stat,
   symlink,
   writeFile,
@@ -62,6 +63,108 @@ describe("yaca persistence paths", () => {
     const paths = await prepareYacaPaths({ root: requestedRoot });
 
     expect((await stat(paths.root)).mode & 0o777).toBe(0o700);
+  });
+
+  test("rejects a parent replacement returned from the root create checkpoint", async () => {
+    const base = await mkdtemp(join(tmpdir(), "yaca-root-parent-swap-"));
+    temporaryRoots.push(base);
+    const parent = join(base, "parent");
+    const originalParent = join(base, "original-parent");
+    const external = join(base, "external");
+    const requestedRoot = join(parent, "data");
+    await mkdir(parent, { mode: 0o700 });
+    await chmod(parent, 0o700);
+    await mkdir(external, { mode: 0o700 });
+    await chmod(external, 0o700);
+    const externalBefore = await lstat(external);
+
+    await expect(
+      prepareYacaPaths({
+        root: requestedRoot,
+        faultInjector: async (operation, context) => {
+          if (operation !== "directory-before-create" || context.name !== "root") return;
+          await rename(parent, originalParent);
+          await symlink(external, parent, "dir");
+        },
+      }),
+    ).rejects.toThrow();
+
+    const externalAfter = await lstat(external);
+    expect(externalAfter.ino).toBe(externalBefore.ino);
+    expect(externalAfter.mode).toBe(externalBefore.mode);
+    expect(await readdir(external)).toEqual([]);
+    expect(await readdir(originalParent)).toEqual([]);
+  });
+
+  test("rejects a newly created root replaced before descriptor verification", async () => {
+    const base = await mkdtemp(join(tmpdir(), "yaca-root-leaf-swap-"));
+    temporaryRoots.push(base);
+    const requestedRoot = join(base, "data");
+    const createdRoot = join(base, "created-root");
+    const userDirectory = join(base, "user-directory");
+    const protectedFile = join(userDirectory, "protected.txt");
+    const protectedBytes = Buffer.from("protected root bytes\n");
+    await mkdir(userDirectory, { mode: 0o755 });
+    await chmod(userDirectory, 0o755);
+    await writeFile(protectedFile, protectedBytes, { mode: 0o640 });
+    const userBefore = await lstat(userDirectory);
+    const fileBefore = await lstat(protectedFile);
+
+    await expect(
+      prepareYacaPaths({
+        root: requestedRoot,
+        faultInjector: async (operation, context) => {
+          if (operation !== "directory-created" || context.name !== "root") return;
+          await rename(requestedRoot, createdRoot);
+          await rename(userDirectory, requestedRoot);
+        },
+      }),
+    ).rejects.toThrow();
+
+    const userAfter = await lstat(requestedRoot);
+    const fileAfter = await lstat(join(requestedRoot, "protected.txt"));
+    expect(userAfter.ino).toBe(userBefore.ino);
+    expect(userAfter.mode).toBe(userBefore.mode);
+    expect(fileAfter.ino).toBe(fileBefore.ino);
+    expect(fileAfter.mode).toBe(fileBefore.mode);
+    await expect(readFile(join(requestedRoot, "protected.txt"))).resolves.toEqual(protectedBytes);
+    expect(await readdir(createdRoot)).toEqual([]);
+  });
+
+  test("rejects a newly created child replaced before descriptor verification", async () => {
+    const base = await mkdtemp(join(tmpdir(), "yaca-child-leaf-swap-"));
+    temporaryRoots.push(base);
+    const requestedRoot = join(base, "data");
+    const createdAgent = join(base, "created-agent");
+    const userDirectory = join(base, "user-agent");
+    const protectedFile = join(userDirectory, "protected.txt");
+    const protectedBytes = Buffer.from("protected child bytes\n");
+    await mkdir(userDirectory, { mode: 0o755 });
+    await chmod(userDirectory, 0o755);
+    await writeFile(protectedFile, protectedBytes, { mode: 0o640 });
+    const userBefore = await lstat(userDirectory);
+    const fileBefore = await lstat(protectedFile);
+
+    await expect(
+      prepareYacaPaths({
+        root: requestedRoot,
+        faultInjector: async (operation, context) => {
+          if (operation !== "directory-created" || context.name !== "agent") return;
+          await rename(join(requestedRoot, "agent"), createdAgent);
+          await rename(userDirectory, join(requestedRoot, "agent"));
+        },
+      }),
+    ).rejects.toThrow();
+
+    const visibleAgent = join(requestedRoot, "agent");
+    const userAfter = await lstat(visibleAgent);
+    const fileAfter = await lstat(join(visibleAgent, "protected.txt"));
+    expect(userAfter.ino).toBe(userBefore.ino);
+    expect(userAfter.mode).toBe(userBefore.mode);
+    expect(fileAfter.ino).toBe(fileBefore.ino);
+    expect(fileAfter.mode).toBe(fileBefore.mode);
+    await expect(readFile(join(visibleAgent, "protected.txt"))).resolves.toEqual(protectedBytes);
+    expect(await readdir(createdAgent)).toEqual([]);
   });
 
   test("rejects an existing root with unsafe permissions without repairing it", async () => {
