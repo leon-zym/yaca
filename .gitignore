@@ -7,3 +7,5 @@ test-results/
 .env.local
 *.log
 .DS_Store
+
+docs/notes/
